@@ -31,12 +31,15 @@ class MacroSignal:
     description: str
 
 class FreeDataHarvester:
+    """جمع‌آوری داده‌های کلان مالی از منابع ۱۰۰٪ رایگان و آزاد"""
+
     def __init__(self, fred_api_key: Optional[str] = None):
         self.fred_api_key = fred_api_key or os.getenv("FRED_API_KEY")
 
     async def fetch_fred_series(self, series_id: str, limit: int = 60) -> pd.Series:
+        """واکشی سری زمانی از پایگاه داده فدرال‌رزرو سنت لوئیس (FRED)"""
         if not self.fred_api_key:
-            logger.warning(f"FRED_API_KEY یافت نشد. مقدار خالی برای {series_id}")
+            logger.warning(f"کلید FRED_API_KEY یافت نشد. سری {series_id} رد شد.")
             return pd.Series(dtype=float)
 
         url = "https://api.stlouisfed.org/fred/series/observations"
@@ -57,30 +60,38 @@ class FreeDataHarvester:
                     df["date"] = pd.to_datetime(df["date"])
                     df["value"] = pd.to_numeric(df["value"], errors="coerce")
                     return df.dropna().sort_values("date").set_index("date")["value"]
+                else:
+                    logger.error(f"خطای دریافت FRED ({series_id}): {res.status_code}")
             except Exception as e:
-                logger.error(f"خطا در دریافت سری {series_id}: {e}")
+                logger.error(f"خطا در ارتباط با FRED برای {series_id}: {e}")
         return pd.Series(dtype=float)
 
     async def fetch_defillama_stablecoins(self) -> float:
+        """رهگیری ضرب و سوزاندن استیبل‌کوین‌های نهادی از DefiLlama"""
         url = "https://stablecoins.llama.fi/stablecoincharts/all"
         async with httpx.AsyncClient(timeout=15.0) as client:
             try:
                 res = await client.get(url)
                 if res.status_code == 200:
-                    df = pd.DataFrame(res.json())
-                    df["date"] = pd.to_datetime(df["date"].astype(int), unit="s")
-                    df["totalPeggedUSD"] = pd.to_numeric(df["totalUSD"].apply(lambda x: x.get("peggedUSD", 0) if isinstance(x, dict) else 0))
-                    df = df.sort_values("date").set_index("date")
-                    
-                    if len(df) >= 30:
-                        current_val = df["totalPeggedUSD"].iloc[-1]
-                        past_30d_val = df["totalPeggedUSD"].iloc[-30]
-                        return round(((current_val - past_30d_val) / past_30d_val) * 100.0, 2)
+                    raw_data = res.json()
+                    if isinstance(raw_data, list) and len(raw_data) >= 30:
+                        def get_usd(entry):
+                            val = entry.get("totalCirculatingUSD") or entry.get("totalUSD") or {}
+                            if isinstance(val, dict):
+                                return float(val.get("peggedUSD", 0))
+                            return float(val) if isinstance(val, (int, float)) else 0.0
+
+                        current_val = get_usd(raw_data[-1])
+                        past_30d_val = get_usd(raw_data[-30])
+                        
+                        if past_30d_val > 0:
+                            return round(((current_val - past_30d_val) / past_30d_val) * 100.0, 2)
             except Exception as e:
-                logger.error(f"خطا در استیبل‌کوین‌های DefiLlama: {e}")
+                logger.error(f"خطا در پردازش دیتای DefiLlama: {e}")
         return 0.0
 
     def fetch_market_matrix(self) -> Dict[str, pd.DataFrame]:
+        """دریافت دیتای زنده دارایی‌های جهانی از Yahoo Finance"""
         tickers = {
             "SPX": "^GSPC",
             "Gold": "GC=F",
@@ -95,14 +106,18 @@ class FreeDataHarvester:
                 if not hist.empty:
                     data_matrix[name] = hist
             except Exception as e:
-                logger.error(f"خطا در نماد {name}: {e}")
+                logger.error(f"خطا در دانلود دیتای نماد {name}: {e}")
         return data_matrix
 
+
 class MacroPredictiveEngine:
+    """موتور تحلیل و کشف ردپای پول هوشمند در افق ۳۰ روزه"""
+
     def __init__(self, harvester: FreeDataHarvester):
         self.harvester = harvester
 
     async def analyze(self) -> MacroSignal:
+        # دریافت داده‌های لوله‌کشی نقدینگی فدرال‌رزرو
         walcl = await self.harvester.fetch_fred_series("WALCL")
         tga = await self.harvester.fetch_fred_series("WTREGEN")
         rrp = await self.harvester.fetch_fred_series("RRPONTSYD")
@@ -110,6 +125,7 @@ class MacroPredictiveEngine:
         hy_oas = await self.harvester.fetch_fred_series("BAMLH0A0HYM2")
         stablecoin_roc = await self.harvester.fetch_defillama_stablecoins()
 
+        # محاسبه نقدینگی خالص: ترازنامه - حساب خزانه‌داری - ریورس ریپو
         liquidity_roc = 0.0
         if not walcl.empty and not tga.empty and not rrp.empty:
             combined = pd.DataFrame({"walcl": walcl, "tga": tga, "rrp": rrp}).ffill().dropna()
@@ -120,6 +136,7 @@ class MacroPredictiveEngine:
         curve_slope = float(t10y2y.iloc[-1]) if not t10y2y.empty else 0.0
         credit_oas = float(hy_oas.iloc[-1]) if not hy_oas.empty else 3.5
 
+        # نمره‌دهی ناهنجاری کلان
         stress_points = 0.0
         direction = "NEUTRAL"
         anomaly = False
@@ -160,7 +177,10 @@ class MacroPredictiveEngine:
             description=desc
         )
 
+
 class NotificationDispatcher:
+    """سیستم توزیع هشدارها به تلگرام و ایمیل با قابلیت Fallback"""
+
     def __init__(self):
         self.tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
         self.tg_chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -172,23 +192,48 @@ class NotificationDispatcher:
 
     async def send_telegram(self, message: str):
         if not self.tg_token or not self.tg_chat_id:
-            logger.warning("اطلاعات تلگرام تنظیم نشده است.")
+            logger.warning("اطلاعات تلگرام در سکرت‌ها ناقص است.")
             return
 
-        url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
-        payload = {"chat_id": self.tg_chat_id, "text": message, "parse_mode": "HTML"}
+        chat_id_clean = str(self.tg_chat_id).strip()
+        url = f"https://api.telegram.org/bot{self.tg_token.strip()}/sendMessage"
+        
+        payload = {
+            "chat_id": chat_id_clean,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        
         async with httpx.AsyncClient(timeout=15.0) as client:
             try:
                 res = await client.post(url, json=payload)
                 if res.status_code == 200:
                     logger.info("پیام تلگرام با موفقیت ارسال شد.")
+                elif res.status_code == 400:
+                    # ارسال متن ساده در صورت خطای تگ‌های HTML
+                    payload.pop("parse_mode", None)
+                    clean_text = (
+                        message.replace("<b>", "")
+                        .replace("</b>", "")
+                        .replace("<code>", "")
+                        .replace("</code>", "")
+                        .replace("<i>", "")
+                        .replace("</i>", "")
+                    )
+                    payload["text"] = clean_text
+                    retry_res = await client.post(url, json=payload)
+                    if retry_res.status_code == 200:
+                        logger.info("پیام تلگرام به صورت متن ساده ارسال شد.")
+                    else:
+                        logger.error(f"خطای مجدد ارسال تلگرام: {retry_res.text}")
                 else:
                     logger.error(f"خطای تلگرام: {res.text}")
             except Exception as e:
-                logger.error(f"خطای اتصال تلگرام: {e}")
+                logger.error(f"خطای اتصال به شبکه تلگرام: {e}")
 
     def send_email(self, subject: str, body_html: str):
         if not self.smtp_user or not self.smtp_pass or not self.email_receiver:
+            logger.warning("اطلاعات SMTP ناقص است.")
             return
         try:
             msg = MIMEMultipart("alternative")
@@ -196,6 +241,7 @@ class NotificationDispatcher:
             msg["From"] = self.smtp_user
             msg["To"] = self.email_receiver
             msg.attach(MIMEText(body_html, "html"))
+            
             with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
                 server.starttls()
                 server.login(self.smtp_user, self.smtp_pass)
@@ -204,7 +250,10 @@ class NotificationDispatcher:
         except Exception as e:
             logger.error(f"خطای ارسال ایمیل: {e}")
 
+
 class MacroOrchestrator:
+    """مدیریت اجرای اسکن‌ها و تولید گزارش جامع"""
+
     def __init__(self):
         self.harvester = FreeDataHarvester()
         self.engine = MacroPredictiveEngine(self.harvester)
@@ -238,13 +287,13 @@ class MacroOrchestrator:
         report = (
             f"🌐 <b>گزارش جامع هفتگی وضعیت اقتصاد و نقدینگی کلان</b>\n"
             f"📅 تاریخ: {datetime.now().strftime('%Y-%m-%d')}\n\n"
-            f"<b>۱. وضعیت لوله‌کشی نقدینگی:</b>\n"
+            f"<b>۱. وضعیت لوله‌کشی نقدینگی جهانی:</b>\n"
             f"{signal.description}\n"
             f"<b>۲. بازدهی هفتگی دارایی‌های کلان:</b>\n"
             f"• شاخص S&P 500: <code>{spx}</code>\n"
             f"• طلای جهانی: <code>{gold}</code>\n"
             f"• نفت خام: <code>{oil}</code>\n\n"
-            f"<b>۳. وضعیت کلی ریسک پول هوشمند:</b>\n"
+            f"<b>۳. ارزیابی ریسک پول هوشمند:</b>\n"
             f"• وضعیت فاز: <b>{signal.direction}</b>\n"
             f"• شاخص استرس سیستمی: <code>{signal.cross_asset_stress_index}/100</code>\n"
         )
