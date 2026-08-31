@@ -1,14 +1,16 @@
 import asyncio
-from datetime import datetime
 from macro_alpha_engine import MacroOrchestrator
 
 async def main():
     orchestrator = MacroOrchestrator()
-    # اسکن روزانه
+    print("--- در حال بررسی و ارسال گزارش وضعیت بازار به تلگرام و ایمیل ---")
+    
+    # ارسال گزارش جامع وضعیت نقدینگی و بازارها در هر اجرا
+    await orchestrator.run_weekly_macro_report()
+    
+    # اسکن برای ناهنجاری‌های شدید ۳۰ روزه
     await orchestrator.run_daily_scan()
-    # اگر روز یکشنبه باشد یا اجرای دستی باشد، گزارش هفتگی هم ارسال شود
-    if datetime.now().weekday() == 6:
-        await orchestrator.run_weekly_macro_report()
+    print("--- عملیات با موفقیت انجام شد ---")
 
 if __name__ == "__main__":
     asyncio.run(main())
