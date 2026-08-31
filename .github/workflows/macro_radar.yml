@@ -1,0 +1,36 @@
+name: Global Macro Liquidity Radar
+
+on:
+  schedule:
+    # اجرا هر روز ساعت 08:30 صبح به وقت UTC
+    - cron: '30 8 * * *'
+  # امکان اجرای دستی با دکمه
+  workflow_dispatch:
+
+jobs:
+  macro-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: دریافت کدهای ریپازیتوری
+        uses: actions/checkout@v4
+
+      - name: نصب پایتون
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: نصب وابستگی‌ها
+        run: pip install -r requirements.txt
+
+      - name: اجرای ربات ماکرو
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+        run: python run_once.py
