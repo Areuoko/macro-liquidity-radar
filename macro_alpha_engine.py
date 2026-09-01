@@ -1,144 +1,297 @@
 """
-Macro Alpha & Global Liquidity Engine
+Macro Alpha & Global Liquidity Engine (fixed)
 Author: DevGod & MacroStrategist
 Engine: Async Multi-Source Macro & Central Bank Liquidity Radar
+
+اصلاحات نسبت به نسخه‌ی قبلی:
+  1) دیگر هیچ عددِ ثابتِ باورپذیر به‌عنوان «داده‌ی زنده» نمایش داده نمی‌شود.
+     اگر منبع اصلی شکست بخورد، به آخرین مقدارِ *واقعیِ* ذخیره‌شده در کش
+     برمی‌گردیم و آن را با برچسبِ صریحِ «کش <تاریخ>» نشان می‌دهیم؛ اگر کشی هم
+     نبود، مقدار به‌صورت N/A نمایش داده می‌شود — هیچ‌وقت جعلی به‌جای واقعی نه.
+  2) هر سری، پیش از استفاده، بررسیِ «تازگی» می‌شود (STALE_AFTER_DAYS)؛ اگر
+     آخرین نقطه‌ی داده خیلی قدیمی باشد (باگ قبلی VIX که یک هفته کهنه بود)،
+     به‌عنوان شکست در نظر گرفته می‌شود، نه به‌عنوان مقدار «جاری».
+  3) شیب منحنی ۱۰-۲ ساله دیگر با واحد غلط «bps» نمایش داده نمی‌شود
+     (T10Y2Y از قبل به درصد است، نه بیسیس‌پوینت).
+  4) هر نماد یاهو جداگانه دانلود می‌شود (نه یک‌جا/batch) تا عدم تطابقِ
+     تقویم معاملاتی بین دارایی‌های ۵روزه (سهام/طلا/نفت) و ۷روزه (BTC) باعث
+     جابه‌جاییِ ایندکسِ «آخرین روز» نشود.
+  5) اگر هر یک از متریک‌های حیاتی گزارش N/A یا کش باشد، این موضوع صریحاً
+     در پاورقیِ گزارش اعلام می‌شود.
 """
 
 import asyncio
 import io
+import json
 import os
-import sys
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
 import httpx
-import numpy as np
 import pandas as pd
 import yfinance as yf
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configuration & Secrets
+# --------------------------------------------------------------------------- #
+# پیکربندی و کلیدها
+# --------------------------------------------------------------------------- #
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/csv,application/csv,text/plain,*/*",
 }
 
+CACHE_PATH = Path(__file__).resolve().parent / "data_cache.json"
+STALE_AFTER_DAYS = 4        # اگر آخرین نقطه‌ی داده کهنه‌تر از این بود => شکست فرض شود
+FRED_MAX_RETRIES = 2
+FRED_RETRY_BACKOFF_S = 1.5
 
-async def fetch_fred_series(
-    client: httpx.AsyncClient, series_id: str
-) -> pd.Series:
-    """Fetch raw economic time-series directly from St. Louis Fed without mandatory API key."""
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+
+# --------------------------------------------------------------------------- #
+# کش پایدار: به‌جای «مقدار پیشِ‌فرضِ هاردکد»، آخرین مقدار واقعیِ موفق را با
+# تاریخش نگه می‌داریم. توجه: روی GitHub Actions این فایل باید بین اجراها
+# persist شود (نگاه کنید به قدم commit-back در ورک‌فلو).
+# --------------------------------------------------------------------------- #
+def load_cache() -> dict:
+    if CACHE_PATH.exists():
+        try:
+            return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[WARN] Cache file unreadable, starting empty: {e}")
+    return {}
+
+
+def save_cache(cache: dict) -> None:
     try:
-        resp = await client.get(url, headers=HEADERS, timeout=12.0)
-        if resp.status_code == 200:
-            df = pd.read_csv(io.StringIO(resp.text))
-            df.columns = ["date", "value"]
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df["value"] = pd.to_numeric(df["value"], errors="coerce")
-            df = df.dropna().sort_values("date").reset_index(drop=True)
-            return df.set_index("date")["value"]
+        CACHE_PATH.write_text(
+            json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
     except Exception as e:
-        print(f"[WARN] Failed fetching FRED series {series_id}: {e}")
+        print(f"[WARN] Failed writing cache file: {e}")
+
+
+class Metric:
+    """
+    یک عدد به‌همراه منشاش:
+      status = "live"    -> همین اجرا از منبع اصلی خوانده شد
+      status = "cached"   -> منبع اصلی شکست خورد؛ آخرین مقدار موفقِ قبلی
+      status = "missing"  -> نه داده‌ی زنده و نه کش قبلی موجود بود
+    """
+
+    __slots__ = ("value", "status", "as_of")
+
+    def __init__(self, value: Optional[float], status: str, as_of: Optional[str] = None):
+        self.value = value
+        self.status = status
+        self.as_of = as_of
+
+    @property
+    def ok(self) -> bool:
+        return self.value is not None
+
+    def fmt(self, spec: str = "+.2f", unit: str = "%") -> str:
+        if self.value is None:
+            return "N/A ⚠️"
+        text = format(self.value, spec) + unit
+        if self.status == "cached":
+            text += f" (کش {self.as_of})"
+        return text
+
+
+def to_metric(cache: dict, key: str, result: Optional[tuple]) -> Metric:
+    """result باید (value, as_of_iso) یا None باشد."""
+    if result is not None:
+        value, as_of = result
+        cache[key] = {"value": value, "as_of": as_of}
+        return Metric(value, "live", as_of)
+
+    cached = cache.get(key)
+    if cached:
+        return Metric(cached["value"], "cached", cached["as_of"])
+
+    return Metric(None, "missing")
+
+
+def _is_stale(last_date, stale_after_days: int = STALE_AFTER_DAYS) -> bool:
+    age_days = (datetime.now(timezone.utc).date() - pd.Timestamp(last_date).date()).days
+    return age_days > stale_after_days
+
+
+# --------------------------------------------------------------------------- #
+# FRED
+# --------------------------------------------------------------------------- #
+async def fetch_fred_series(client: httpx.AsyncClient, series_id: str) -> pd.Series:
+    """سری خام از FRED با retry؛ در صورت شکست نهایی سری خالی برمی‌گرداند."""
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    last_err = "unknown"
+    for attempt in range(1, FRED_MAX_RETRIES + 1):
+        try:
+            resp = await client.get(url, headers=HEADERS, timeout=15.0, follow_redirects=True)
+            if resp.status_code == 200 and resp.text.strip().lower().startswith(("date", "observation_date")):
+                df = pd.read_csv(io.StringIO(resp.text))
+                df.columns = ["date", "value"]
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                df["value"] = pd.to_numeric(df["value"], errors="coerce")
+                df = df.dropna().sort_values("date").reset_index(drop=True)
+                if not df.empty:
+                    return df.set_index("date")["value"]
+                last_err = "parsed CSV but no valid rows"
+            else:
+                last_err = f"HTTP {resp.status_code}, body starts with {resp.text[:60]!r}"
+        except Exception as e:
+            last_err = str(e)
+        if attempt < FRED_MAX_RETRIES:
+            await asyncio.sleep(FRED_RETRY_BACKOFF_S * attempt)
+    print(f"[WARN] FRED fetch failed for {series_id} after {FRED_MAX_RETRIES} tries: {last_err}")
     return pd.Series(dtype=float)
 
 
-async def fetch_defillama_stablecoins(client: httpx.AsyncClient) -> dict:
-    """Fetch institutional stablecoin total market cap dynamics from DeFiLlama API."""
+def compute_fed_net_liquidity(walcl: pd.Series, tga: pd.Series, rrp: pd.Series):
+    """نقدینگی خالص فدرال‌رزرو = WALCL - TGA - RRP، تغییر ۳۰روزه (٪)."""
+    if walcl.empty or tga.empty or rrp.empty:
+        return None
+    fed_df = pd.concat([walcl, tga, rrp], axis=1).dropna()
+    if len(fed_df) < 5:
+        return None
+    fed_df.columns = ["walcl", "tga", "rrp"]
+    # واحدها: WALCL و WTREGEN میلیون دلار، RRPONTSYD میلیارد دلار
+    net = (fed_df["walcl"] - fed_df["tga"]) / 1000.0 - fed_df["rrp"]
+    last_date = net.index[-1]
+    if _is_stale(last_date):
+        print(f"[WARN] Fed liquidity series stale (last point {last_date.date()})")
+        return None
+    curr, prev = net.iloc[-1], net.iloc[-5]
+    if prev == 0:
+        return None
+    pct = ((curr - prev) / abs(prev)) * 100
+    return pct, last_date.strftime("%Y-%m-%d")
+
+
+def compute_last_point(series: pd.Series):
+    """آخرین مقدار یک سری تک‌متغیره (برای شیب منحنی و OAS) + بررسی تازگی."""
+    if series.empty:
+        return None
+    last_date = series.index[-1]
+    if _is_stale(last_date):
+        print(f"[WARN] Series stale (last point {last_date.date()})")
+        return None
+    return float(series.iloc[-1]), last_date.strftime("%Y-%m-%d")
+
+
+def compute_pct_change_5(series: pd.Series):
+    """درصد تغییر بین آخرین نقطه و ۵ نقطه‌ی قبل (≈ هفتگی برای بازارهای ۵روزه) + بررسی تازگی."""
+    if len(series) <= 5:
+        return None
+    last_date = series.index[-1]
+    if _is_stale(last_date):
+        print(f"[WARN] Series stale (last point {last_date.date()})")
+        return None
+    curr, prev = float(series.iloc[-1]), float(series.iloc[-6])
+    if prev == 0:
+        return None
+    pct = ((curr - prev) / abs(prev)) * 100
+    return pct, last_date.strftime("%Y-%m-%d")
+
+
+# --------------------------------------------------------------------------- #
+# استیبل‌کوین‌ها (DeFiLlama)
+# --------------------------------------------------------------------------- #
+async def fetch_defillama_stablecoins(client: httpx.AsyncClient):
+    """رشد ۷روزه‌ی کل بازار استیبل‌کوین + حجم فعلی. خروجی: (growth_pct, total_b, as_of) یا None."""
     url = "https://stablecoins.llama.fi/stablecoincharts/all?usdatt=true"
     try:
-        resp = await client.get(url, headers=HEADERS, timeout=12.0)
-        if resp.status_code == 200:
-            data = resp.json()
-            if len(data) >= 8:
-                current_mcap = data[-1]["totalCirculating"]["peggedUSD"]
-                prev_7d_mcap = data[-8]["totalCirculating"]["peggedUSD"]
-                growth_7d = (
-                    (current_mcap - prev_7d_mcap) / prev_7d_mcap
-                ) * 100
-                return {
-                    "total_mcap_b": current_mcap / 1e9,
-                    "growth_7d_pct": growth_7d,
-                }
+        resp = await client.get(url, headers=HEADERS, timeout=15.0)
+        if resp.status_code != 200:
+            print(f"[WARN] DeFiLlama HTTP {resp.status_code}")
+            return None
+        data = resp.json()
+        if len(data) < 8:
+            return None
+        current_mcap = data[-1]["totalCirculating"]["peggedUSD"]
+        prev_7d_mcap = data[-8]["totalCirculating"]["peggedUSD"]
+        if prev_7d_mcap == 0:
+            return None
+        growth_7d = ((current_mcap - prev_7d_mcap) / prev_7d_mcap) * 100
+        as_of = datetime.fromtimestamp(int(data[-1]["date"]), tz=timezone.utc).strftime("%Y-%m-%d")
+        if _is_stale(as_of):
+            print(f"[WARN] Stablecoin data stale (last point {as_of})")
+            return None
+        return growth_7d, current_mcap / 1e9, as_of
     except Exception as e:
-        print(f"[WARN] Failed fetching Stablecoin metrics: {e}")
-    return {"total_mcap_b": 0.0, "growth_7d_pct": 0.0}
+        print(f"[WARN] Failed fetching stablecoin metrics: {e}")
+        return None
 
 
-def fetch_yahoo_market_data() -> dict:
-    """Fetch macro asset performance asynchronously wrapped."""
-    tickers = {
-        "SPX": "^GSPC",
-        "Gold": "GC=F",
-        "Oil": "CL=F",
-        "DXY": "DX-Y.NYB",
-        "BTC": "BTC-USD",
-        "VIX": "^VIX",
-    }
-    results = {}
+# --------------------------------------------------------------------------- #
+# یاهو فایننس — هر نماد جداگانه (نه batch) تا تقویم‌های معاملاتی قاطی نشوند
+# --------------------------------------------------------------------------- #
+def _fetch_yahoo_ticker_sync(ticker: str) -> pd.Series:
     try:
-        data = yf.download(
-            list(tickers.values()),
-            period="1mo",
-            interval="1d",
-            progress=False,
-            auto_adjust=True,
-        )["Close"]
-        for name, ticker in tickers.items():
-            if ticker in data.columns:
-                series = data[ticker].dropna()
-                if len(series) >= 6:
-                    current = float(series.iloc[-1])
-                    prev_5d = float(series.iloc[-6])
-                    pct_5d = ((current - prev_5d) / prev_5d) * 100
-                    results[name] = {"price": current, "pct_5d": pct_5d}
+        hist = yf.Ticker(ticker).history(period="2mo", interval="1d", auto_adjust=True)
+        if hist.empty:
+            return pd.Series(dtype=float)
+        s = hist["Close"].dropna()
+        s.index = pd.to_datetime(s.index).tz_localize(None)
+        return s
     except Exception as e:
-        print(f"[WARN] Failed fetching Yahoo Finance tickers: {e}")
-    return results
+        print(f"[WARN] yfinance fetch failed for {ticker}: {e}")
+        return pd.Series(dtype=float)
 
 
+async def fetch_all_yahoo_series(tickers: dict) -> dict:
+    """دانلود موازیِ هر نماد در یک ترد جدا (yfinance sync است)."""
+
+    async def _one(name, tk):
+        series = await asyncio.to_thread(_fetch_yahoo_ticker_sync, tk)
+        return name, series
+
+    pairs = await asyncio.gather(*[_one(n, t) for n, t in tickers.items()])
+    return dict(pairs)
+
+
+# --------------------------------------------------------------------------- #
+# شاخص استرس سیستمی — فقط وقتی همه‌ی ورودی‌های حیاتی موجودند محاسبه می‌شود
+# --------------------------------------------------------------------------- #
 def calculate_systemic_stress(
-    yield_curve: float, oas_spread: float, vix: float, fed_liq_30d: float
+    yield_curve_pct: float, oas_spread: float, vix: float, fed_liq_30d_pct: float
 ) -> tuple[float, str]:
-    """Quantitative Multi-Factor Risk Assessment Engine."""
     stress_score = 0.0
 
-    # 1. Yield curve inversion penalty
-    if yield_curve < 0:
+    if yield_curve_pct < 0:
         stress_score += 25.0
-    elif yield_curve < 0.2:
+    elif yield_curve_pct < 0.2:
         stress_score += 10.0
 
-    # 2. Credit Spread Stress (OAS)
     if oas_spread > 4.5:
         stress_score += 35.0
     elif oas_spread > 3.5:
         stress_score += 20.0
-    elif oas_spread < 2.8:
-        stress_score += 0.0  # Ultra-loose credit
 
-    # 3. Volatility (VIX)
     if vix > 28.0:
         stress_score += 25.0
     elif vix > 20.0:
         stress_score += 15.0
 
-    # 4. Liquidity Drain
-    if fed_liq_30d < -2.0:
+    if fed_liq_30d_pct < -2.0:
         stress_score += 15.0
-    elif fed_liq_30d < -0.5:
+    elif fed_liq_30d_pct < -0.5:
         stress_score += 5.0
 
     stress_score = min(100.0, max(0.0, stress_score))
 
-    # Phase classification
     if stress_score <= 15.0:
         phase = (
             "RISK-ON EXPANSION (توسعه و ریسک‌پذیری)"
-            if fed_liq_30d >= 0
+            if fed_liq_30d_pct >= 0
             else "NEUTRAL / ROTATIONAL (خنثی و چرخش هوشمند)"
         )
     elif stress_score <= 45.0:
@@ -149,130 +302,133 @@ def calculate_systemic_stress(
     return round(stress_score, 1), phase
 
 
+# --------------------------------------------------------------------------- #
+# پایپ‌لاین اصلی
+# --------------------------------------------------------------------------- #
 async def run_pipeline():
     print("[INFO] Initiating Macro Alpha Pipeline...")
+    cache = load_cache()
+
     async with httpx.AsyncClient() as client:
-        # Fetch FRED data in parallel
-        walcl_task = fetch_fred_series(client, "WALCL")  # Fed Total Assets
-        tga_task = fetch_fred_series(
-            client, "WTREGEN"
-        )  # Treasury General Account
-        rrp_task = fetch_fred_series(
-            client, "RRPONTSYD"
-        )  # Overnight Reverse Repo
-        t10y2y_task = fetch_fred_series(client, "T10Y2Y")  # 10Y-2Y Yield Curve
-        oas_task = fetch_fred_series(
-            client, "BAMLH0A0HYM2"
-        )  # US High Yield OAS
-        ecb_task = fetch_fred_series(
-            client, "ECBASSETSW"
-        )  # ECB Balance Sheet Proxy
-        boj_task = fetch_fred_series(client, "JPNASSETS")  # BOJ Total Assets
+        walcl_task = fetch_fred_series(client, "WALCL")
+        tga_task = fetch_fred_series(client, "WTREGEN")
+        rrp_task = fetch_fred_series(client, "RRPONTSYD")
+        t10y2y_task = fetch_fred_series(client, "T10Y2Y")
+        oas_task = fetch_fred_series(client, "BAMLH0A0HYM2")
+        ecb_task = fetch_fred_series(client, "ECBASSETSW")
         stablecoins_task = fetch_defillama_stablecoins(client)
 
         (
-            walcl,
-            tga,
-            rrp,
-            t10y2y,
-            oas,
-            ecb_assets,
-            boj_assets,
-            stablecoin_data,
+            walcl, tga, rrp, t10y2y, oas, ecb_assets, stablecoin_result,
         ) = await asyncio.gather(
-            walcl_task,
-            tga_task,
-            rrp_task,
-            t10y2y_task,
-            oas_task,
-            ecb_task,
-            boj_task,
+            walcl_task, tga_task, rrp_task, t10y2y_task, oas_task, ecb_task,
             stablecoins_task,
         )
 
-    # 1. Fed Net Liquidity Calculation = Assets - TGA - RRP
-    fed_df = pd.concat([walcl, tga, rrp], axis=1).dropna()
-    fed_df.columns = ["walcl", "tga", "rrp"]
-    # Normalize units: WALCL is in Millions, WTREGEN in Millions, RRPONTSYD in Billions
-    # Checking units: WALCL (Millions), WTREGEN (Millions), RRP (Billions * 1000)
-    fed_df["net_liq_billions"] = (
-        fed_df["walcl"] - fed_df["tga"]
-    ) / 1000.0 - fed_df["rrp"]
+    yahoo_tickers = {
+        "SPX": "^GSPC", "Gold": "GC=F", "Oil": "CL=F", "BTC": "BTC-USD", "VIX": "^VIX",
+    }
+    yahoo_series = await fetch_all_yahoo_series(yahoo_tickers)
 
-    if len(fed_df) >= 4:
-        curr_liq = fed_df["net_liq_billions"].iloc[-1]
-        prev_liq = fed_df["net_liq_billions"].iloc[-5]  # ~30 days
-        fed_liq_30d_pct = ((curr_liq - prev_liq) / abs(prev_liq)) * 100
+    # ---- ساخت متریک‌ها (هر کدام: زنده / کش-با-تاریخ / N/A) ------------------
+    fed_liq = to_metric(cache, "fed_liq_30d_pct", compute_fed_net_liquidity(walcl, tga, rrp))
+    curve = to_metric(cache, "curve_slope_pct", compute_last_point(t10y2y))
+    oas_m = to_metric(cache, "credit_oas_pct", compute_last_point(oas))
+
+    # ECB: تغییر ۵نقطه‌ای مشابه fed_liq اما تک‌سری است
+    def _ecb_change():
+        if len(ecb_assets) < 5:
+            return None
+        last_date = ecb_assets.index[-1]
+        if _is_stale(last_date):
+            return None
+        curr, prev = ecb_assets.iloc[-1], ecb_assets.iloc[-5]
+        if prev == 0:
+            return None
+        return ((curr - prev) / abs(prev)) * 100, last_date.strftime("%Y-%m-%d")
+    ecb_m = to_metric(cache, "ecb_mom_pct", _ecb_change())
+
+    stable_growth = to_metric(
+        cache, "stablecoin_growth_pct",
+        (stablecoin_result[0], stablecoin_result[2]) if stablecoin_result else None,
+    )
+    stable_total = to_metric(
+        cache, "stablecoin_total_b",
+        (stablecoin_result[1], stablecoin_result[2]) if stablecoin_result else None,
+    )
+
+    spx_m = to_metric(cache, "spx_pct", compute_pct_change_5(yahoo_series.get("SPX", pd.Series(dtype=float))))
+    gold_m = to_metric(cache, "gold_pct", compute_pct_change_5(yahoo_series.get("Gold", pd.Series(dtype=float))))
+    oil_m = to_metric(cache, "oil_pct", compute_pct_change_5(yahoo_series.get("Oil", pd.Series(dtype=float))))
+    btc_m = to_metric(cache, "btc_pct", compute_pct_change_5(yahoo_series.get("BTC", pd.Series(dtype=float))))
+    vix_m = to_metric(cache, "vix_level", compute_last_point(yahoo_series.get("VIX", pd.Series(dtype=float))))
+
+    save_cache(cache)
+
+    # ---- استرس سیستمی: فقط اگر هر ۴ ورودی حیاتی موجودند ----------------------
+    critical = [curve, oas_m, vix_m, fed_liq]
+    if all(m.ok for m in critical):
+        stress_index, market_phase = calculate_systemic_stress(
+            curve.value, oas_m.value, vix_m.value, fed_liq.value
+        )
+        stress_str = f"{stress_index}/100"
     else:
-        fed_liq_30d_pct = -0.21
+        stress_str = "N/A ⚠️"
+        market_phase = "قابل محاسبه نیست (داده‌ی حیاتی ناقص)"
 
-    # 2. Key Spreads & Central Banks
-    curve_slope = float(t10y2y.iloc[-1]) if not t10y2y.empty else 0.39
-    credit_oas = float(oas.iloc[-1]) if not oas.empty else 2.63
+    # ---- پاورقیِ کیفیتِ داده -------------------------------------------------
+    all_metrics = {
+        "نقدینگی فدرال‌رزرو": fed_liq, "شیب منحنی": curve, "OAS": oas_m,
+        "ترازنامه ECB": ecb_m, "استیبل‌کوین (رشد)": stable_growth,
+        "استیبل‌کوین (حجم)": stable_total, "S&P 500": spx_m, "طلا": gold_m,
+        "نفت": oil_m, "BTC": btc_m, "VIX": vix_m,
+    }
+    issues = [f"{name} ({m.status})" for name, m in all_metrics.items() if m.status != "live"]
+    quality_note = ""
+    if issues:
+        quality_note = "\n\n⚠️ <b>هشدار کیفیت داده:</b> " + "، ".join(issues)
 
-    # Global CB Momentum (ECB + BOJ)
-    ecb_mom = (
-        ((ecb_assets.iloc[-1] - ecb_assets.iloc[-5]) / ecb_assets.iloc[-5])
-        * 100
-        if len(ecb_assets) >= 5
-        else 0.0
-    )
-
-    # 3. Market Returns
-    market_data = fetch_yahoo_market_data()
-    spx_pct = market_data.get("SPX", {}).get("pct_5d", 0.77)
-    gold_pct = market_data.get("Gold", {}).get("pct_5d", -3.23)
-    oil_pct = market_data.get("Oil", {}).get("pct_5d", 4.77)
-    btc_pct = market_data.get("BTC", {}).get("pct_5d", 2.15)
-    vix_val = market_data.get("VIX", {}).get("price", 14.8)
-
-    # 4. Stress Index
-    stress_index, market_phase = calculate_systemic_stress(
-        curve_slope, credit_oas, vix_val, fed_liq_30d_pct
-    )
-
-    # Format Date
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    curve_bps = curve.value * 100 if curve.ok else None
+    curve_display = (
+        f"{curve.fmt('+.2f', '%')}" + (f" (≈{curve_bps:+.0f} bps)" if curve_bps is not None else "")
+        if curve.ok else curve.fmt()
+    )
 
-    # Build Elite Strategic Report
     report = f"""🌐 <b>گزارش جامع هفتگی وضعیت اقتصاد و نقدینگی کلان</b>
 📅 <b>تاریخ:</b> <code>{today_str}</code>
 
 <b>۱. وضعیت لوله‌کشی نقدینگی و بانک‌های مرکزی:</b>
-🔹 نقدینگی خالص فدرال‌رزرو (۳۰ روزه): <code>{fed_liq_30d_pct:+.2f}%</code>
-🔹 شیب منحنی بازده ۱۰ساله-۲ساله: <code>{curve_slope:+.2f} bps</code>
-🔹 اسپرد ریسک اعتباری اوراق (OAS): <code>{credit_oas:.2f}%</code>
-🔹 نرخ رشد ترازنامه بانک مرکزی اروپا (ECB): <code>{ecb_mom:+.2f}%</code>
-🔹 رشد موجودی استیبل‌کوین‌های نهادی: <code>{stablecoin_data['growth_7d_pct']:+.2f}%</code> (حجم کل: <code>${stablecoin_data['total_mcap_b']:.1f}B</code>)
+🔹 نقدینگی خالص فدرال‌رزرو (۳۰ روزه): <code>{fed_liq.fmt()}</code>
+🔹 شیب منحنی بازده ۱۰ساله-۲ساله: <code>{curve_display}</code>
+🔹 اسپرد ریسک اعتباری اوراق (OAS): <code>{oas_m.fmt()}</code>
+🔹 نرخ رشد ترازنامه بانک مرکزی اروپا (ECB): <code>{ecb_m.fmt()}</code>
+🔹 رشد موجودی استیبل‌کوین‌های نهادی: <code>{stable_growth.fmt()}</code> (حجم کل: <code>${stable_total.fmt('.1f', 'B')}</code>)
 
 <b>۲. بازدهی هفتگی دارایی‌های کلان (Macro Assets):</b>
-• شاخص S&P 500: <code>{spx_pct:+.2f}%</code>
-• طلای جهانی: <code>{gold_pct:+.2f}%</code>
-• نفت خام: <code>{oil_pct:+.2f}%</code>
-• بیت‌کوین (BTC): <code>{btc_pct:+.2f}%</code>
+• شاخص S&P 500: <code>{spx_m.fmt()}</code>
+• طلای جهانی: <code>{gold_m.fmt()}</code>
+• نفت خام: <code>{oil_m.fmt()}</code>
+• بیت‌کوین (BTC): <code>{btc_m.fmt()}</code>
 
 <b>۳. ارزیابی ریسک و موقعیت پول هوشمند (Smart Money):</b>
 • وضعیت فاز بازار: <b>{market_phase}</b>
-• شاخص استرس سیستمی: <code>{stress_index}/100</code>
-• شاخص نوسانات بازار بدهی/سهام (VIX): <code>{vix_val:.1f}</code>
+• شاخص استرس سیستمی: <code>{stress_str}</code>
+• شاخص نوسانات بازار بدهی/سهام (VIX): <code>{vix_m.fmt('.1f', '')}</code>
 
-⚡ <i>تولید شده توسط Macro Alpha Engine — اجرای خودکار</i>"""
+⚡ <i>تولید شده توسط Macro Alpha Engine — اجرای خودکار</i>{quality_note}"""
 
     print("\n--- GENERATED REPORT ---")
     print(report)
     print("------------------------\n")
 
-    # Dispatch Alerts
     await dispatch_notifications(report)
 
 
 async def dispatch_notifications(message_html: str):
     async with httpx.AsyncClient() as client:
-        # Telegram Dispatch
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            tg_url = (
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            )
+            tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             payload = {
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message_html,
@@ -284,13 +440,10 @@ async def dispatch_notifications(message_html: str):
                 if r.status_code == 200:
                     print("[SUCCESS] Telegram message delivered successfully.")
                 else:
-                    print(
-                        f"[ERROR] Telegram API Error: {r.status_code} - {r.text}"
-                    )
+                    print(f"[ERROR] Telegram API Error: {r.status_code} - {r.text}")
             except Exception as e:
                 print(f"[ERROR] Failed to send Telegram: {e}")
 
-        # Discord Webhook Dispatch
         if DISCORD_WEBHOOK_URL:
             discord_payload = {
                 "content": message_html.replace("<b>", "**")
@@ -299,11 +452,11 @@ async def dispatch_notifications(message_html: str):
                 .replace("</code>", "`")
             }
             try:
-                r = await client.post(
-                    DISCORD_WEBHOOK_URL, json=discord_payload, timeout=10.0
-                )
+                r = await client.post(DISCORD_WEBHOOK_URL, json=discord_payload, timeout=10.0)
                 if r.status_code in (200, 204):
                     print("[SUCCESS] Discord alert delivered successfully.")
+                else:
+                    print(f"[ERROR] Discord webhook error: {r.status_code} - {r.text}")
             except Exception as e:
                 print(f"[ERROR] Failed to send Discord: {e}")
 
