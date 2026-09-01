@@ -18,10 +18,13 @@ Engine: Async Multi-Source Macro & Central Bank Liquidity Radar
      جابه‌جاییِ ایندکسِ «آخرین روز» نشود.
   5) اگر هر یک از متریک‌های حیاتی گزارش N/A یا کش باشد، این موضوع صریحاً
      در پاورقیِ گزارش اعلام می‌شود.
+  6) fetch از FRED دیگر از اسکرپِ fredgraph.csv انجام نمی‌شود (آن endpoint
+     از IPهای دیتاسنتری/گیت‌هاب‌اکشنز به‌طور مکرر با تایم‌اوتِ بی‌پیام شکست
+     می‌خورد) و به‌جایش از API رسمی FRED با کلید (متغیر محیطی FRED_API_KEY)
+     استفاده می‌شود.
 """
 
 import asyncio
-import io
 import json
 import os
 from datetime import datetime, timezone
@@ -127,28 +130,53 @@ def _is_stale(last_date, stale_after_days: int = STALE_AFTER_DAYS) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# FRED
+# FRED — API رسمی (نه اسکرپ fredgraph.csv که از IPهای دیتاسنتری/گیت‌هاب‌اکشنز
+# اغلب تایم‌اوت بی‌پیام می‌داد؛ ریشه‌ی مشکل قبلی همین بود)
 # --------------------------------------------------------------------------- #
+FRED_API_KEY = os.getenv("FRED_API_KEY")
+FRED_API_URL = "https://api.stlouisfed.org/fred/series/observations"
+
+
 async def fetch_fred_series(client: httpx.AsyncClient, series_id: str) -> pd.Series:
-    """سری خام از FRED با retry؛ در صورت شکست نهایی سری خالی برمی‌گرداند."""
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    """سری از API رسمی FRED (JSON)؛ در صورت شکست نهایی سری خالی برمی‌گرداند."""
+    if not FRED_API_KEY:
+        print(f"[WARN] FRED_API_KEY تنظیم نشده؛ fetch برای {series_id} رد شد.")
+        return pd.Series(dtype=float)
+
+    params = {
+        "series_id": series_id,
+        "api_key": FRED_API_KEY,
+        "file_type": "json",
+        "sort_order": "asc",
+        "observation_start": (datetime.now(timezone.utc) - pd.Timedelta(days=120)).strftime("%Y-%m-%d"),
+    }
     last_err = "unknown"
     for attempt in range(1, FRED_MAX_RETRIES + 1):
         try:
-            resp = await client.get(url, headers=HEADERS, timeout=15.0, follow_redirects=True)
-            if resp.status_code == 200 and resp.text.strip().lower().startswith(("date", "observation_date")):
-                df = pd.read_csv(io.StringIO(resp.text))
-                df.columns = ["date", "value"]
-                df["date"] = pd.to_datetime(df["date"], errors="coerce")
-                df["value"] = pd.to_numeric(df["value"], errors="coerce")
-                df = df.dropna().sort_values("date").reset_index(drop=True)
-                if not df.empty:
-                    return df.set_index("date")["value"]
-                last_err = "parsed CSV but no valid rows"
+            resp = await client.get(FRED_API_URL, params=params, timeout=15.0)
+            if resp.status_code == 200:
+                payload = resp.json()
+                obs = payload.get("observations", [])
+                if obs:
+                    df = pd.DataFrame(obs)[["date", "value"]]
+                    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                    # FRED مقادیر گم‌شده را به‌صورت رشته‌ی "." برمی‌گرداند؛
+                    # to_numeric با errors="coerce" این‌ها را خودکار NaN می‌کند
+                    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+                    df = df.dropna().sort_values("date").reset_index(drop=True)
+                    if not df.empty:
+                        return df.set_index("date")["value"]
+                    last_err = "parsed JSON but no valid numeric observations"
+                else:
+                    last_err = "empty observations array"
+            elif resp.status_code in (400, 403):
+                # معمولاً یعنی خودِ کلید API نامعتبر/غیرفعال است — تلاش دوباره فایده ندارد
+                last_err = f"HTTP {resp.status_code} (احتمالاً کلید API نامعتبر): {resp.text[:150]!r}"
+                break
             else:
-                last_err = f"HTTP {resp.status_code}, body starts with {resp.text[:60]!r}"
+                last_err = f"HTTP {resp.status_code}: {resp.text[:150]!r}"
         except Exception as e:
-            last_err = str(e)
+            last_err = f"{type(e).__name__}" + (f": {e}" if str(e) else "")
         if attempt < FRED_MAX_RETRIES:
             await asyncio.sleep(FRED_RETRY_BACKOFF_S * attempt)
     print(f"[WARN] FRED fetch failed for {series_id} after {FRED_MAX_RETRIES} tries: {last_err}")
