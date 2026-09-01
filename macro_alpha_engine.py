@@ -22,6 +22,10 @@ Engine: Async Multi-Source Macro & Central Bank Liquidity Radar
      از IPهای دیتاسنتری/گیت‌هاب‌اکشنز به‌طور مکرر با تایم‌اوتِ بی‌پیام شکست
      می‌خورد) و به‌جایش از API رسمی FRED با کلید (متغیر محیطی FRED_API_KEY)
      استفاده می‌شود.
+  7) WALCL و ECBASSETSW سری‌هایی هفتگی‌اند (به‌ترتیب چهارشنبه‌ها و جمعه‌ها
+     منتشر می‌شوند)، پس آستانه‌ی تازگی جداگانه‌ای (WEEKLY_STALE_AFTER_DAYS)
+     برایشان در نظر گرفته شده تا با آستانه‌ی سری‌های روزانه اشتباه گرفته
+     نشوند و به‌غلط «کهنه» علامت نخورند.
 """
 
 import asyncio
@@ -55,6 +59,7 @@ HEADERS = {
 
 CACHE_PATH = Path(__file__).resolve().parent / "data_cache.json"
 STALE_AFTER_DAYS = 4        # اگر آخرین نقطه‌ی داده کهنه‌تر از این بود => شکست فرض شود
+WEEKLY_STALE_AFTER_DAYS = 10 # برای سری‌های هفتگی (WALCL چهارشنبه‌ها، ECBASSETSW جمعه‌ها)
 FRED_MAX_RETRIES = 2
 FRED_RETRY_BACKOFF_S = 1.5
 
@@ -194,7 +199,7 @@ def compute_fed_net_liquidity(walcl: pd.Series, tga: pd.Series, rrp: pd.Series):
     # واحدها: WALCL و WTREGEN میلیون دلار، RRPONTSYD میلیارد دلار
     net = (fed_df["walcl"] - fed_df["tga"]) / 1000.0 - fed_df["rrp"]
     last_date = net.index[-1]
-    if _is_stale(last_date):
+    if _is_stale(last_date, WEEKLY_STALE_AFTER_DAYS):
         print(f"[WARN] Fed liquidity series stale (last point {last_date.date()})")
         return None
     curr, prev = net.iloc[-1], net.iloc[-5]
@@ -363,15 +368,21 @@ async def run_pipeline():
     curve = to_metric(cache, "curve_slope_pct", compute_last_point(t10y2y))
     oas_m = to_metric(cache, "credit_oas_pct", compute_last_point(oas))
 
-    # ECB: تغییر ۵نقطه‌ای مشابه fed_liq اما تک‌سری است
+    # ECB: تغییر ۵نقطه‌ای مشابه fed_liq اما تک‌سری است (ECBASSETSW هم هفتگی است: جمعه‌ها)
     def _ecb_change():
+        if ecb_assets.empty:
+            print("[WARN] ECB series empty (fetch likely failed)")
+            return None
         if len(ecb_assets) < 5:
+            print(f"[WARN] ECB series too short ({len(ecb_assets)} points)")
             return None
         last_date = ecb_assets.index[-1]
-        if _is_stale(last_date):
+        if _is_stale(last_date, WEEKLY_STALE_AFTER_DAYS):
+            print(f"[WARN] ECB series stale (last point {last_date.date()})")
             return None
         curr, prev = ecb_assets.iloc[-1], ecb_assets.iloc[-5]
         if prev == 0:
+            print("[WARN] ECB series has zero baseline, skipping pct calc")
             return None
         return ((curr - prev) / abs(prev)) * 100, last_date.strftime("%Y-%m-%d")
     ecb_m = to_metric(cache, "ecb_mom_pct", _ecb_change())
