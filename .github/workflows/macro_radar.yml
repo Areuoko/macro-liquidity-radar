@@ -6,6 +6,10 @@ on:
     - cron: '0 6 * * 1'
   workflow_dispatch: # امکان اجرای دستی با یک کلیک در گیت‌هاب
 
+# لازم برای commit-back خودکارِ data_cache.json در پایان هر اجرا
+permissions:
+  contents: write
+
 jobs:
   run-macro-engine:
     runs-on: ubuntu-latest
@@ -31,3 +35,19 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python run_once.py
+
+      # data_cache.json فقط داخل رانر ساخته/به‌روز می‌شود و با پایان جاب از
+      # بین می‌رود؛ بدون این قدم، مکانیزم «کش با تاریخ» هیچ‌وقت بین اجراهای
+      # هفتگی دووم نمی‌آورد و همیشه از صفر شروع می‌شود. این قدم فقط وقتی
+      # فایل واقعاً تغییر کرده کامیت می‌زند.
+      - name: Persist data cache
+        run: |
+          if [ -n "$(git status --porcelain data_cache.json 2>/dev/null)" ]; then
+            git config user.name "macro-radar-bot"
+            git config user.email "actions@github.com"
+            git add data_cache.json
+            git commit -m "chore: update cached macro data [skip ci]"
+            git push
+          else
+            echo "No cache changes to commit."
+          fi
