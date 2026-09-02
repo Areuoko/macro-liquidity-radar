@@ -26,6 +26,19 @@ Engine: Async Multi-Source Macro & Central Bank Liquidity Radar
      منتشر می‌شوند)، پس آستانه‌ی تازگی جداگانه‌ای (WEEKLY_STALE_AFTER_DAYS)
      برایشان در نظر گرفته شده تا با آستانه‌ی سری‌های روزانه اشتباه گرفته
      نشوند و به‌غلط «کهنه» علامت نخورند.
+
+فاز ۱ — تکمیل پوشش بانک‌های مرکزی (PBoC / BoJ / DXY):
+  8) BoJ: از سری رسمی و زنده‌ی FRED به‌نام JPNASSETS استفاده می‌شود
+     (ماهانه، واحد ۱۰۰ میلیون ین). چون ماهانه است، آستانه‌ی تازگی جداگانه‌ای
+     (MONTHLY_STALE_AFTER_DAYS) دارد؛ نباید با آستانه‌ی هفتگی/روزانه قاطی شود.
+  9) PBoC: هیچ سری معتبر و پرفرکانسی برای «کل دارایی‌های ترازنامه»ی PBoC
+     روی FRED پیدا نشد (برخلاف Fed/ECB/BoJ، چین در این سطح از جزئیات
+     پوشش داده نمی‌شود). به‌جایش از رشد M2 چین (MYAGM2CNM189N، ماهانه)
+     به‌عنوان یک پراکسیِ نقدینگی استفاده می‌شود — این صراحتاً در نام متریک و
+     گزارش به‌عنوان «پراکسی» برچسب می‌خورد، نه «ترازنامه‌ی PBoC»، تا کسی
+     این دو را با هم اشتباه نگیرد.
+ 10) DXY: از تیکر یاهو DX-Y.NYB استفاده می‌شود، دقیقاً هم‌الگو با
+     SPX/Gold/Oil/BTC (fetch جداگانه، بدون منبع جدید).
 """
 
 import asyncio
@@ -60,6 +73,9 @@ HEADERS = {
 CACHE_PATH = Path(__file__).resolve().parent / "data_cache.json"
 STALE_AFTER_DAYS = 4        # اگر آخرین نقطه‌ی داده کهنه‌تر از این بود => شکست فرض شود
 WEEKLY_STALE_AFTER_DAYS = 10 # برای سری‌های هفتگی (WALCL چهارشنبه‌ها، ECBASSETSW جمعه‌ها)
+MONTHLY_STALE_AFTER_DAYS = 45 # برای سری‌های ماهانه با تأخیر انتشار (JPNASSETS، MYAGM2CNM189N)
+                               # این عدد اولیه است؛ باید در برابر اجرای واقعی GitHub Actions
+                               # صحت‌سنجی شود (همان روشی که برای ECB طی شد)
 FRED_MAX_RETRIES = 2
 FRED_RETRY_BACKOFF_S = 1.5
 
@@ -220,6 +236,29 @@ def compute_last_point(series: pd.Series):
     return float(series.iloc[-1]), last_date.strftime("%Y-%m-%d")
 
 
+def compute_fred_period_change(series: pd.Series, lookback: int, stale_after_days: int):
+    """
+    درصد تغییر بین آخرین نقطه و `lookback` نقطه‌ی قبل، برای سری‌های FRED با
+    فرکانس غیرروزانه (هفتگی/ماهانه). آستانه‌ی تازگی جداگانه می‌گیرد چون این
+    سری‌ها با تأخیرهای متفاوتی منتشر می‌شوند.
+    مثال: ECBASSETSW هفتگی است => lookback=4 (۴ گام به عقب از iloc[-1] یعنی iloc[-5]؛
+          ≈۱ماه، دقیقاً همان چیزی که کد قبلی fed_liq/ECB با iloc[-5] محاسبه می‌کرد)
+          با WEEKLY_STALE_AFTER_DAYS
+          JPNASSETS/MYAGM2CNM189N ماهانه‌اند => lookback=1 (ماه به ماه) با MONTHLY_STALE_AFTER_DAYS
+    """
+    if len(series) <= lookback:
+        return None
+    last_date = series.index[-1]
+    if _is_stale(last_date, stale_after_days):
+        print(f"[WARN] Series stale (last point {last_date.date()})")
+        return None
+    curr, prev = float(series.iloc[-1]), float(series.iloc[-1 - lookback])
+    if prev == 0:
+        return None
+    pct = ((curr - prev) / abs(prev)) * 100
+    return pct, last_date.strftime("%Y-%m-%d")
+
+
 def compute_pct_change_5(series: pd.Series):
     """درصد تغییر بین آخرین نقطه و ۵ نقطه‌ی قبل (≈ هفتگی برای بازارهای ۵روزه) + بررسی تازگی."""
     if len(series) <= 5:
@@ -349,17 +388,22 @@ async def run_pipeline():
         t10y2y_task = fetch_fred_series(client, "T10Y2Y")
         oas_task = fetch_fred_series(client, "BAMLH0A0HYM2")
         ecb_task = fetch_fred_series(client, "ECBASSETSW")
+        boj_task = fetch_fred_series(client, "JPNASSETS")
+        china_m2_task = fetch_fred_series(client, "MYAGM2CNM189N")
         stablecoins_task = fetch_defillama_stablecoins(client)
 
         (
-            walcl, tga, rrp, t10y2y, oas, ecb_assets, stablecoin_result,
+            walcl, tga, rrp, t10y2y, oas, ecb_assets, boj_assets, china_m2,
+            stablecoin_result,
         ) = await asyncio.gather(
             walcl_task, tga_task, rrp_task, t10y2y_task, oas_task, ecb_task,
+            boj_task, china_m2_task,
             stablecoins_task,
         )
 
     yahoo_tickers = {
         "SPX": "^GSPC", "Gold": "GC=F", "Oil": "CL=F", "BTC": "BTC-USD", "VIX": "^VIX",
+        "DXY": "DX-Y.NYB",
     }
     yahoo_series = await fetch_all_yahoo_series(yahoo_tickers)
 
@@ -369,23 +413,24 @@ async def run_pipeline():
     oas_m = to_metric(cache, "credit_oas_pct", compute_last_point(oas))
 
     # ECB: تغییر ۵نقطه‌ای مشابه fed_liq اما تک‌سری است (ECBASSETSW هم هفتگی است: جمعه‌ها)
-    def _ecb_change():
-        if ecb_assets.empty:
-            print("[WARN] ECB series empty (fetch likely failed)")
-            return None
-        if len(ecb_assets) < 5:
-            print(f"[WARN] ECB series too short ({len(ecb_assets)} points)")
-            return None
-        last_date = ecb_assets.index[-1]
-        if _is_stale(last_date, WEEKLY_STALE_AFTER_DAYS):
-            print(f"[WARN] ECB series stale (last point {last_date.date()})")
-            return None
-        curr, prev = ecb_assets.iloc[-1], ecb_assets.iloc[-5]
-        if prev == 0:
-            print("[WARN] ECB series has zero baseline, skipping pct calc")
-            return None
-        return ((curr - prev) / abs(prev)) * 100, last_date.strftime("%Y-%m-%d")
-    ecb_m = to_metric(cache, "ecb_mom_pct", _ecb_change())
+    if not ecb_assets.empty and len(ecb_assets) < 5:
+        print(f"[WARN] ECB series too short ({len(ecb_assets)} points)")
+    ecb_m = to_metric(
+        cache, "ecb_mom_pct",
+        compute_fred_period_change(ecb_assets, lookback=4, stale_after_days=WEEKLY_STALE_AFTER_DAYS),
+    )
+
+    # BoJ: ماهانه (JPNASSETS)؛ تغییر ماه‌به‌ماه (lookback=1) با آستانه‌ی تازگی ماهانه
+    boj_m = to_metric(
+        cache, "boj_mom_pct",
+        compute_fred_period_change(boj_assets, lookback=1, stale_after_days=MONTHLY_STALE_AFTER_DAYS),
+    )
+
+    # PBoC: پراکسی — رشد M2 چین (نه ترازنامه‌ی واقعی PBoC؛ نگاه کنید به یادداشت فاز ۱ در هدر فایل)
+    china_m2_m = to_metric(
+        cache, "china_m2_mom_pct",
+        compute_fred_period_change(china_m2, lookback=1, stale_after_days=MONTHLY_STALE_AFTER_DAYS),
+    )
 
     stable_growth = to_metric(
         cache, "stablecoin_growth_pct",
@@ -401,6 +446,7 @@ async def run_pipeline():
     oil_m = to_metric(cache, "oil_pct", compute_pct_change_5(yahoo_series.get("Oil", pd.Series(dtype=float))))
     btc_m = to_metric(cache, "btc_pct", compute_pct_change_5(yahoo_series.get("BTC", pd.Series(dtype=float))))
     vix_m = to_metric(cache, "vix_level", compute_last_point(yahoo_series.get("VIX", pd.Series(dtype=float))))
+    dxy_m = to_metric(cache, "dxy_pct", compute_pct_change_5(yahoo_series.get("DXY", pd.Series(dtype=float))))
 
     save_cache(cache)
 
@@ -418,9 +464,10 @@ async def run_pipeline():
     # ---- پاورقیِ کیفیتِ داده -------------------------------------------------
     all_metrics = {
         "نقدینگی فدرال‌رزرو": fed_liq, "شیب منحنی": curve, "OAS": oas_m,
-        "ترازنامه ECB": ecb_m, "استیبل‌کوین (رشد)": stable_growth,
-        "استیبل‌کوین (حجم)": stable_total, "S&P 500": spx_m, "طلا": gold_m,
-        "نفت": oil_m, "BTC": btc_m, "VIX": vix_m,
+        "ترازنامه ECB": ecb_m, "ترازنامه BoJ": boj_m, "M2 چین (پراکسی PBoC)": china_m2_m,
+        "استیبل‌کوین (رشد)": stable_growth, "استیبل‌کوین (حجم)": stable_total,
+        "S&P 500": spx_m, "طلا": gold_m, "نفت": oil_m, "BTC": btc_m, "VIX": vix_m,
+        "DXY": dxy_m,
     }
     issues = [f"{name} ({m.status})" for name, m in all_metrics.items() if m.status != "live"]
     quality_note = ""
@@ -442,6 +489,8 @@ async def run_pipeline():
 🔹 شیب منحنی بازده ۱۰ساله-۲ساله: <code>{curve_display}</code>
 🔹 اسپرد ریسک اعتباری اوراق (OAS): <code>{oas_m.fmt()}</code>
 🔹 نرخ رشد ترازنامه بانک مرکزی اروپا (ECB): <code>{ecb_m.fmt()}</code>
+🔹 نرخ رشد ترازنامه بانک مرکزی ژاپن (BoJ): <code>{boj_m.fmt()}</code>
+🔹 رشد M2 چین (پراکسی نقدینگی PBoC): <code>{china_m2_m.fmt()}</code>
 🔹 رشد موجودی استیبل‌کوین‌های نهادی: <code>{stable_growth.fmt()}</code> (حجم کل: <code>${stable_total.fmt('.1f', 'B')}</code>)
 
 <b>۲. بازدهی هفتگی دارایی‌های کلان (Macro Assets):</b>
@@ -449,6 +498,7 @@ async def run_pipeline():
 • طلای جهانی: <code>{gold_m.fmt()}</code>
 • نفت خام: <code>{oil_m.fmt()}</code>
 • بیت‌کوین (BTC): <code>{btc_m.fmt()}</code>
+• شاخص دلار (DXY): <code>{dxy_m.fmt()}</code>
 
 <b>۳. ارزیابی ریسک و موقعیت پول هوشمند (Smart Money):</b>
 • وضعیت فاز بازار: <b>{market_phase}</b>
