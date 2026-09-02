@@ -37,9 +37,11 @@ Engine: Async Multi-Source Macro & Central Bank Liquidity Radar
      GitHub Actions با «empty observations array» شکست خورد — یعنی این سری
      IMF-محور اصلاً در پنجره‌ی ۱۲۰روزه‌ی fetch داده‌ای نداشت (تأخیر انتشار
      چند ماهه). به‌جایش از ذخایر ارزی چین (TRESEGCNM052N، ماهانه، IMF)
-     استفاده می‌شود که در عمل تأییدشده و تازه است (تأخیر ~۶۳ روزه، مشابه
-     BoJ). این هم صراحتاً در نام متریک و گزارش به‌عنوان «پراکسی» برچسب
-     می‌خورد، نه «ترازنامه‌ی PBoC».
+     استفاده می‌شود که fetch آن موفق است، اما تأخیر انتشارش از BoJ هم
+     بیشتر است (در عمل ۹۳ روز دیده شد)، پس آستانه‌ی تازگی جداگانه‌ای
+     (CHINA_FX_STALE_AFTER_DAYS) دارد و نباید با آستانه‌ی BoJ قاطی شود.
+     این هم صراحتاً در نام متریک و گزارش به‌عنوان «پراکسی» برچسب می‌خورد،
+     نه «ترازنامه‌ی PBoC».
  10) DXY: از تیکر یاهو DX-Y.NYB استفاده می‌شود، دقیقاً هم‌الگو با
      SPX/Gold/Oil/BTC (fetch جداگانه، بدون منبع جدید).
 """
@@ -76,10 +78,14 @@ HEADERS = {
 CACHE_PATH = Path(__file__).resolve().parent / "data_cache.json"
 STALE_AFTER_DAYS = 4        # اگر آخرین نقطه‌ی داده کهنه‌تر از این بود => شکست فرض شود
 WEEKLY_STALE_AFTER_DAYS = 10 # برای سری‌های هفتگی (WALCL چهارشنبه‌ها، ECBASSETSW جمعه‌ها)
-MONTHLY_STALE_AFTER_DAYS = 75 # برای سری‌های ماهانه با تأخیر انتشار (JPNASSETS، TRESEGCNM052N)
+MONTHLY_STALE_AFTER_DAYS = 75 # برای سری‌های ماهانه با تأخیر انتشار معمول (JPNASSETS)
                                # این عدد در برابر اجرای واقعی GitHub Actions صحت‌سنجی شد:
                                # آخرین نقطه‌ی JPNASSETS معمولاً ~۶۳ روز از تاریخ اجرا عقب‌تره
                                # (۴۵ روز اولیه بیش‌ازحد سخت‌گیرانه بود و به‌غلط «کهنه» می‌زد)
+CHINA_FX_STALE_AFTER_DAYS = 120 # TRESEGCNM052N (ذخایر ارزی چین) از BoJ هم عقب‌تر منتشر می‌شود؛
+                                 # در عمل روی Actions آخرین نقطه ۹۳ روز عقب‌تر دیده شد، پس آستانه‌ی
+                                 # جدا و شل‌تری لازم داشت — طبق همان اصل «یک آستانه‌ی سراسری باعث
+                                 # data gap می‌شود» که برای WALCL/ECBASSETSW هم رعایت شده بود
 FRED_MAX_RETRIES = 2
 FRED_RETRY_BACKOFF_S = 1.5
 
@@ -433,7 +439,7 @@ async def run_pipeline():
     # PBoC: پراکسی — رشد ذخایر ارزی چین (نه ترازنامه‌ی واقعی PBoC؛ نگاه کنید به یادداشت فاز ۱ در هدر فایل)
     china_fx_m = to_metric(
         cache, "china_fx_reserves_mom_pct",
-        compute_fred_period_change(china_fx, lookback=1, stale_after_days=MONTHLY_STALE_AFTER_DAYS),
+        compute_fred_period_change(china_fx, lookback=1, stale_after_days=CHINA_FX_STALE_AFTER_DAYS),
     )
 
     stable_growth = to_metric(
