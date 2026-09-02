@@ -33,10 +33,13 @@ Engine: Async Multi-Source Macro & Central Bank Liquidity Radar
      (MONTHLY_STALE_AFTER_DAYS) دارد؛ نباید با آستانه‌ی هفتگی/روزانه قاطی شود.
   9) PBoC: هیچ سری معتبر و پرفرکانسی برای «کل دارایی‌های ترازنامه»ی PBoC
      روی FRED پیدا نشد (برخلاف Fed/ECB/BoJ، چین در این سطح از جزئیات
-     پوشش داده نمی‌شود). به‌جایش از رشد M2 چین (MYAGM2CNM189N، ماهانه)
-     به‌عنوان یک پراکسیِ نقدینگی استفاده می‌شود — این صراحتاً در نام متریک و
-     گزارش به‌عنوان «پراکسی» برچسب می‌خورد، نه «ترازنامه‌ی PBoC»، تا کسی
-     این دو را با هم اشتباه نگیرد.
+     پوشش داده نمی‌شود). گزینه‌ی اول (M2 چین، MYAGM2CNM189N) در عمل روی
+     GitHub Actions با «empty observations array» شکست خورد — یعنی این سری
+     IMF-محور اصلاً در پنجره‌ی ۱۲۰روزه‌ی fetch داده‌ای نداشت (تأخیر انتشار
+     چند ماهه). به‌جایش از ذخایر ارزی چین (TRESEGCNM052N، ماهانه، IMF)
+     استفاده می‌شود که در عمل تأییدشده و تازه است (تأخیر ~۶۳ روزه، مشابه
+     BoJ). این هم صراحتاً در نام متریک و گزارش به‌عنوان «پراکسی» برچسب
+     می‌خورد، نه «ترازنامه‌ی PBoC».
  10) DXY: از تیکر یاهو DX-Y.NYB استفاده می‌شود، دقیقاً هم‌الگو با
      SPX/Gold/Oil/BTC (fetch جداگانه، بدون منبع جدید).
 """
@@ -73,9 +76,10 @@ HEADERS = {
 CACHE_PATH = Path(__file__).resolve().parent / "data_cache.json"
 STALE_AFTER_DAYS = 4        # اگر آخرین نقطه‌ی داده کهنه‌تر از این بود => شکست فرض شود
 WEEKLY_STALE_AFTER_DAYS = 10 # برای سری‌های هفتگی (WALCL چهارشنبه‌ها، ECBASSETSW جمعه‌ها)
-MONTHLY_STALE_AFTER_DAYS = 45 # برای سری‌های ماهانه با تأخیر انتشار (JPNASSETS، MYAGM2CNM189N)
-                               # این عدد اولیه است؛ باید در برابر اجرای واقعی GitHub Actions
-                               # صحت‌سنجی شود (همان روشی که برای ECB طی شد)
+MONTHLY_STALE_AFTER_DAYS = 75 # برای سری‌های ماهانه با تأخیر انتشار (JPNASSETS، TRESEGCNM052N)
+                               # این عدد در برابر اجرای واقعی GitHub Actions صحت‌سنجی شد:
+                               # آخرین نقطه‌ی JPNASSETS معمولاً ~۶۳ روز از تاریخ اجرا عقب‌تره
+                               # (۴۵ روز اولیه بیش‌ازحد سخت‌گیرانه بود و به‌غلط «کهنه» می‌زد)
 FRED_MAX_RETRIES = 2
 FRED_RETRY_BACKOFF_S = 1.5
 
@@ -244,7 +248,7 @@ def compute_fred_period_change(series: pd.Series, lookback: int, stale_after_day
     مثال: ECBASSETSW هفتگی است => lookback=4 (۴ گام به عقب از iloc[-1] یعنی iloc[-5]؛
           ≈۱ماه، دقیقاً همان چیزی که کد قبلی fed_liq/ECB با iloc[-5] محاسبه می‌کرد)
           با WEEKLY_STALE_AFTER_DAYS
-          JPNASSETS/MYAGM2CNM189N ماهانه‌اند => lookback=1 (ماه به ماه) با MONTHLY_STALE_AFTER_DAYS
+          JPNASSETS/TRESEGCNM052N ماهانه‌اند => lookback=1 (ماه به ماه) با MONTHLY_STALE_AFTER_DAYS
     """
     if len(series) <= lookback:
         return None
@@ -389,15 +393,15 @@ async def run_pipeline():
         oas_task = fetch_fred_series(client, "BAMLH0A0HYM2")
         ecb_task = fetch_fred_series(client, "ECBASSETSW")
         boj_task = fetch_fred_series(client, "JPNASSETS")
-        china_m2_task = fetch_fred_series(client, "MYAGM2CNM189N")
+        china_fx_task = fetch_fred_series(client, "TRESEGCNM052N")
         stablecoins_task = fetch_defillama_stablecoins(client)
 
         (
-            walcl, tga, rrp, t10y2y, oas, ecb_assets, boj_assets, china_m2,
+            walcl, tga, rrp, t10y2y, oas, ecb_assets, boj_assets, china_fx,
             stablecoin_result,
         ) = await asyncio.gather(
             walcl_task, tga_task, rrp_task, t10y2y_task, oas_task, ecb_task,
-            boj_task, china_m2_task,
+            boj_task, china_fx_task,
             stablecoins_task,
         )
 
@@ -426,10 +430,10 @@ async def run_pipeline():
         compute_fred_period_change(boj_assets, lookback=1, stale_after_days=MONTHLY_STALE_AFTER_DAYS),
     )
 
-    # PBoC: پراکسی — رشد M2 چین (نه ترازنامه‌ی واقعی PBoC؛ نگاه کنید به یادداشت فاز ۱ در هدر فایل)
-    china_m2_m = to_metric(
-        cache, "china_m2_mom_pct",
-        compute_fred_period_change(china_m2, lookback=1, stale_after_days=MONTHLY_STALE_AFTER_DAYS),
+    # PBoC: پراکسی — رشد ذخایر ارزی چین (نه ترازنامه‌ی واقعی PBoC؛ نگاه کنید به یادداشت فاز ۱ در هدر فایل)
+    china_fx_m = to_metric(
+        cache, "china_fx_reserves_mom_pct",
+        compute_fred_period_change(china_fx, lookback=1, stale_after_days=MONTHLY_STALE_AFTER_DAYS),
     )
 
     stable_growth = to_metric(
@@ -464,7 +468,7 @@ async def run_pipeline():
     # ---- پاورقیِ کیفیتِ داده -------------------------------------------------
     all_metrics = {
         "نقدینگی فدرال‌رزرو": fed_liq, "شیب منحنی": curve, "OAS": oas_m,
-        "ترازنامه ECB": ecb_m, "ترازنامه BoJ": boj_m, "M2 چین (پراکسی PBoC)": china_m2_m,
+        "ترازنامه ECB": ecb_m, "ترازنامه BoJ": boj_m, "ذخایر ارزی چین (پراکسی PBoC)": china_fx_m,
         "استیبل‌کوین (رشد)": stable_growth, "استیبل‌کوین (حجم)": stable_total,
         "S&P 500": spx_m, "طلا": gold_m, "نفت": oil_m, "BTC": btc_m, "VIX": vix_m,
         "DXY": dxy_m,
@@ -490,7 +494,7 @@ async def run_pipeline():
 🔹 اسپرد ریسک اعتباری اوراق (OAS): <code>{oas_m.fmt()}</code>
 🔹 نرخ رشد ترازنامه بانک مرکزی اروپا (ECB): <code>{ecb_m.fmt()}</code>
 🔹 نرخ رشد ترازنامه بانک مرکزی ژاپن (BoJ): <code>{boj_m.fmt()}</code>
-🔹 رشد M2 چین (پراکسی نقدینگی PBoC): <code>{china_m2_m.fmt()}</code>
+🔹 رشد ذخایر ارزی چین (پراکسی نقدینگی PBoC): <code>{china_fx_m.fmt()}</code>
 🔹 رشد موجودی استیبل‌کوین‌های نهادی: <code>{stable_growth.fmt()}</code> (حجم کل: <code>${stable_total.fmt('.1f', 'B')}</code>)
 
 <b>۲. بازدهی هفتگی دارایی‌های کلان (Macro Assets):</b>
