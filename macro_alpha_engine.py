@@ -330,14 +330,19 @@ def _fetch_yahoo_ticker_sync(ticker: str) -> pd.Series:
 
 
 async def fetch_all_yahoo_series(tickers: dict) -> dict:
-    """دانلود موازیِ هر نماد در یک ترد جدا (yfinance sync است)."""
-
-    async def _one(name, tk):
-        series = await asyncio.to_thread(_fetch_yahoo_ticker_sync, tk)
-        return name, series
-
-    pairs = await asyncio.gather(*[_one(n, t) for n, t in tickers.items()])
-    return dict(pairs)
+    """
+    دانلود ترتیبیِ هر نماد در یک ترد جدا (yfinance sync است).
+    عمداً موازی نیست: yfinance داخلی‌اش یک کش sqlite مشترک (برای timezone) دارد
+    و وقتی چند ترد هم‌زمان بهش می‌نویسند، خطای «database is locked» می‌دهد —
+    این باگ واقعی روی GitHub Actions دیده شد (بعد از اضافه‌شدن DXY به ۶ تیکر
+    احتمالش بیشتر شد). چون این پایپ‌لاین هفتگی است و به سرعت حساس نیست،
+    ترتیبی‌بودن (چند ثانیه کندتر) کاملاً قابل‌قبول است و ریسک قفل را از ریشه
+    حذف می‌کند.
+    """
+    result = {}
+    for name, tk in tickers.items():
+        result[name] = await asyncio.to_thread(_fetch_yahoo_ticker_sync, tk)
+    return result
 
 
 # --------------------------------------------------------------------------- #
