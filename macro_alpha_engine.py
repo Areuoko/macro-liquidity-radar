@@ -54,6 +54,16 @@ Engine: Async Multi-Source Macro & Central Bank Liquidity Radar
  13) هر دو متریک فعلاً فقط نمایشی‌اند — طبق تصمیم صریح، وارد فرمول
      calculate_systemic_stress نمی‌شوند؛ بازطراحی آن فرمول برای فاز ۵
      نگه داشته شده تا با rotation score ترکیب شود.
+
+فاز ۳ — سیگنال‌های rotation واقعی (Growth/Value، Cyclical/Defensive، Small/Large):
+ 14) هر سه جفت با ETF واقعی مقایسه می‌شوند نه ایندکس (IWM÷SPY، نه IWM÷^GSPC)
+     چون نسبت باید بین دو دارایی معامله‌پذیرِ هم‌ساختار باشد.
+ 15) تابع عمومی compute_ratio_series سری نسبت a/b را روی تاریخ‌های مشترک
+     می‌سازد؛ سپس با همان compute_last_point (سطح فعلی) و compute_pct_change_5
+     (مومنتوم ۵روزه) که برای SPX/Gold/... استفاده می‌شوند دوباره‌استفاده
+     می‌شود — بدون منطق تازگی/محاسبه‌ی جدید.
+ 16) طبق تصمیم، هم سطح فعلی و هم درصد تغییر ۵روزه نمایش داده می‌شوند؛
+     این‌ها هم فعلاً فقط نمایشی‌اند (نه ورودی stress_score) — همان اصل فاز ۲.
 """
 
 import asyncio
@@ -314,6 +324,22 @@ def compute_pct_change_5(series: pd.Series):
     return pct, last_date.strftime("%Y-%m-%d")
 
 
+def compute_ratio_series(series_a: pd.Series, series_b: pd.Series) -> pd.Series:
+    """
+    سری نسبت a/b روی تاریخ‌های مشترک دو سری (برای سیگنال‌های rotation:
+    Growth/Value، Cyclical/Defensive، Small/Large). خروجی یک سری معمولی
+    است که با همان compute_last_point (سطح فعلی) و compute_pct_change_5
+    (مومنتوم ۵روزه) که برای بقیه‌ی دارایی‌ها استفاده می‌شوند، سازگار است.
+    """
+    if series_a.empty or series_b.empty:
+        return pd.Series(dtype=float)
+    df = pd.concat([series_a, series_b], axis=1).dropna()
+    if df.empty:
+        return pd.Series(dtype=float)
+    df.columns = ["a", "b"]
+    return df["a"] / df["b"]
+
+
 # --------------------------------------------------------------------------- #
 # استیبل‌کوین‌ها (DeFiLlama)
 # --------------------------------------------------------------------------- #
@@ -453,6 +479,11 @@ async def run_pipeline():
     yahoo_tickers = {
         "SPX": "^GSPC", "Gold": "GC=F", "Oil": "CL=F", "BTC": "BTC-USD", "VIX": "^VIX",
         "DXY": "DX-Y.NYB",
+        # فاز ۳ — سیگنال‌های rotation: هر پا به‌صورت ETF جداگانه (نه ایندکس)
+        # چون نسبت باید بین دو دارایی معامله‌پذیرِ هم‌نوع باشد (IWM/SPY، نه IWM/^GSPC)
+        "GrowthETF": "IWF", "ValueETF": "IWD",
+        "CyclicalETF": "XLY", "DefensiveETF": "XLP",
+        "SmallCapETF": "IWM", "LargeCapETF": "SPY",
     }
     yahoo_series = await fetch_all_yahoo_series(yahoo_tickers)
 
@@ -504,6 +535,27 @@ async def run_pipeline():
     vix_m = to_metric(cache, "vix_level", compute_last_point(yahoo_series.get("VIX", pd.Series(dtype=float))))
     dxy_m = to_metric(cache, "dxy_pct", compute_pct_change_5(yahoo_series.get("DXY", pd.Series(dtype=float))))
 
+    # فاز ۳ — سیگنال‌های rotation: سطح فعلیِ نسبت + مومنتوم ۵روزه، برای هر جفت
+    growth_value_ratio = compute_ratio_series(
+        yahoo_series.get("GrowthETF", pd.Series(dtype=float)),
+        yahoo_series.get("ValueETF", pd.Series(dtype=float)),
+    )
+    cyclical_defensive_ratio = compute_ratio_series(
+        yahoo_series.get("CyclicalETF", pd.Series(dtype=float)),
+        yahoo_series.get("DefensiveETF", pd.Series(dtype=float)),
+    )
+    small_large_ratio = compute_ratio_series(
+        yahoo_series.get("SmallCapETF", pd.Series(dtype=float)),
+        yahoo_series.get("LargeCapETF", pd.Series(dtype=float)),
+    )
+
+    gv_level_m = to_metric(cache, "growth_value_ratio_level", compute_last_point(growth_value_ratio))
+    gv_chg_m = to_metric(cache, "growth_value_ratio_5d_pct", compute_pct_change_5(growth_value_ratio))
+    cd_level_m = to_metric(cache, "cyclical_defensive_ratio_level", compute_last_point(cyclical_defensive_ratio))
+    cd_chg_m = to_metric(cache, "cyclical_defensive_ratio_5d_pct", compute_pct_change_5(cyclical_defensive_ratio))
+    sl_level_m = to_metric(cache, "small_large_ratio_level", compute_last_point(small_large_ratio))
+    sl_chg_m = to_metric(cache, "small_large_ratio_5d_pct", compute_pct_change_5(small_large_ratio))
+
     save_cache(cache)
 
     # ---- استرس سیستمی: فقط اگر هر ۴ ورودی حیاتی موجودند ----------------------
@@ -525,6 +577,9 @@ async def run_pipeline():
         "استیبل‌کوین (رشد)": stable_growth, "استیبل‌کوین (حجم)": stable_total,
         "S&P 500": spx_m, "طلا": gold_m, "نفت": oil_m, "BTC": btc_m, "VIX": vix_m,
         "DXY": dxy_m,
+        "Growth/Value (سطح)": gv_level_m, "Growth/Value (Δ۵روزه)": gv_chg_m,
+        "Cyclical/Defensive (سطح)": cd_level_m, "Cyclical/Defensive (Δ۵روزه)": cd_chg_m,
+        "Small/Large (سطح)": sl_level_m, "Small/Large (Δ۵روزه)": sl_chg_m,
     }
     issues = [f"{name} ({m.status})" for name, m in all_metrics.items() if m.status != "live"]
     quality_note = ""
@@ -559,7 +614,12 @@ async def run_pipeline():
 • بیت‌کوین (BTC): <code>{btc_m.fmt()}</code>
 • شاخص دلار (DXY): <code>{dxy_m.fmt()}</code>
 
-<b>۳. ارزیابی ریسک و موقعیت پول هوشمند (Smart Money):</b>
+<b>۳. سیگنال‌های چرخش هوشمند (Rotation Signals):</b>
+🔄 رشد/ارزش (Growth/Value، IWF÷IWD): <code>{gv_level_m.fmt('.3f', '')}</code> | تغییر ۵روزه: <code>{gv_chg_m.fmt()}</code>
+🔄 چرخه‌ای/تدافعی (Cyclical/Defensive، XLY÷XLP): <code>{cd_level_m.fmt('.3f', '')}</code> | تغییر ۵روزه: <code>{cd_chg_m.fmt()}</code>
+🔄 کوچک/بزرگ (Small/Large Cap، IWM÷SPY): <code>{sl_level_m.fmt('.3f', '')}</code> | تغییر ۵روزه: <code>{sl_chg_m.fmt()}</code>
+
+<b>۴. ارزیابی ریسک و موقعیت پول هوشمند (Smart Money):</b>
 • وضعیت فاز بازار: <b>{market_phase}</b>
 • شاخص استرس سیستمی: <code>{stress_str}</code>
 • شاخص نوسانات بازار بدهی/سهام (VIX): <code>{vix_m.fmt('.1f', '')}</code>
