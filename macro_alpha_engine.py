@@ -44,6 +44,16 @@ Engine: Async Multi-Source Macro & Central Bank Liquidity Radar
      نه «ترازنامه‌ی PBoC».
  10) DXY: از تیکر یاهو DX-Y.NYB استفاده می‌شود، دقیقاً هم‌الگو با
      SPX/Gold/Oil/BTC (fetch جداگانه، بدون منبع جدید).
+
+فاز ۲ — استرس اعتباری عمیق‌تر (IG OAS / SOFR-EFFR):
+ 11) IG OAS: سری BAMLC0A0CM (ICE BofA US Corporate Index OAS) از FRED،
+     دقیقاً هم‌الگو با HY OAS موجود (compute_last_point، آستانه‌ی روزانه).
+ 12) SOFR-EFFR: تابع جدید compute_spread_last_point_bps دو سری روزانه‌ی
+     SOFR و EFFR را روی تاریخ‌های مشترک تراز می‌کند و اسپرد را به bps
+     تبدیل می‌کند (هر دو سری از FRED به‌صورت درصد منتشر می‌شوند).
+ 13) هر دو متریک فعلاً فقط نمایشی‌اند — طبق تصمیم صریح، وارد فرمول
+     calculate_systemic_stress نمی‌شوند؛ بازطراحی آن فرمول برای فاز ۵
+     نگه داشته شده تا با rotation score ترکیب شود.
 """
 
 import asyncio
@@ -246,6 +256,26 @@ def compute_last_point(series: pd.Series):
     return float(series.iloc[-1]), last_date.strftime("%Y-%m-%d")
 
 
+def compute_spread_last_point_bps(series_a: pd.Series, series_b: pd.Series):
+    """
+    آخرین اسپرد (a - b) بین دو سری هم‌فرکانس روزانه، بر حسب بیسیس‌پوینت،
+    با تراز کردن روی تاریخ‌های مشترک (برای SOFR - EFFR).
+    هر دو سری FRED از قبل به‌صورت درصد منتشر می‌شوند، پس ضرب در ۱۰۰ => bps.
+    """
+    if series_a.empty or series_b.empty:
+        return None
+    df = pd.concat([series_a, series_b], axis=1).dropna()
+    if df.empty:
+        return None
+    df.columns = ["a", "b"]
+    last_date = df.index[-1]
+    if _is_stale(last_date):
+        print(f"[WARN] Spread series stale (last point {last_date.date()})")
+        return None
+    spread_bps = (float(df["a"].iloc[-1]) - float(df["b"].iloc[-1])) * 100.0
+    return spread_bps, last_date.strftime("%Y-%m-%d")
+
+
 def compute_fred_period_change(series: pd.Series, lookback: int, stale_after_days: int):
     """
     درصد تغییر بین آخرین نقطه و `lookback` نقطه‌ی قبل، برای سری‌های FRED با
@@ -402,16 +432,20 @@ async def run_pipeline():
         rrp_task = fetch_fred_series(client, "RRPONTSYD")
         t10y2y_task = fetch_fred_series(client, "T10Y2Y")
         oas_task = fetch_fred_series(client, "BAMLH0A0HYM2")
+        ig_oas_task = fetch_fred_series(client, "BAMLC0A0CM")
+        sofr_task = fetch_fred_series(client, "SOFR")
+        effr_task = fetch_fred_series(client, "EFFR")
         ecb_task = fetch_fred_series(client, "ECBASSETSW")
         boj_task = fetch_fred_series(client, "JPNASSETS")
         china_fx_task = fetch_fred_series(client, "TRESEGCNM052N")
         stablecoins_task = fetch_defillama_stablecoins(client)
 
         (
-            walcl, tga, rrp, t10y2y, oas, ecb_assets, boj_assets, china_fx,
+            walcl, tga, rrp, t10y2y, oas, ig_oas, sofr, effr, ecb_assets, boj_assets, china_fx,
             stablecoin_result,
         ) = await asyncio.gather(
-            walcl_task, tga_task, rrp_task, t10y2y_task, oas_task, ecb_task,
+            walcl_task, tga_task, rrp_task, t10y2y_task, oas_task, ig_oas_task,
+            sofr_task, effr_task, ecb_task,
             boj_task, china_fx_task,
             stablecoins_task,
         )
@@ -426,6 +460,13 @@ async def run_pipeline():
     fed_liq = to_metric(cache, "fed_liq_30d_pct", compute_fed_net_liquidity(walcl, tga, rrp))
     curve = to_metric(cache, "curve_slope_pct", compute_last_point(t10y2y))
     oas_m = to_metric(cache, "credit_oas_pct", compute_last_point(oas))
+
+    # فاز ۲ — استرس اعتباری عمیق‌تر (فقط نمایشی؛ طبق تصمیم، وارد فرمول
+    # stress_score نمی‌شوند — آن بازطراحی برای فاز ۵ نگه داشته شده)
+    ig_oas_m = to_metric(cache, "credit_ig_oas_pct", compute_last_point(ig_oas))
+    sofr_effr_m = to_metric(
+        cache, "sofr_effr_spread_bps", compute_spread_last_point_bps(sofr, effr)
+    )
 
     # ECB: تغییر ۵نقطه‌ای مشابه fed_liq اما تک‌سری است (ECBASSETSW هم هفتگی است: جمعه‌ها)
     if not ecb_assets.empty and len(ecb_assets) < 5:
@@ -478,7 +519,8 @@ async def run_pipeline():
 
     # ---- پاورقیِ کیفیتِ داده -------------------------------------------------
     all_metrics = {
-        "نقدینگی فدرال‌رزرو": fed_liq, "شیب منحنی": curve, "OAS": oas_m,
+        "نقدینگی فدرال‌رزرو": fed_liq, "شیب منحنی": curve, "OAS (HY)": oas_m,
+        "OAS (IG)": ig_oas_m, "اسپرد SOFR-EFFR": sofr_effr_m,
         "ترازنامه ECB": ecb_m, "ترازنامه BoJ": boj_m, "ذخایر ارزی چین (پراکسی PBoC)": china_fx_m,
         "استیبل‌کوین (رشد)": stable_growth, "استیبل‌کوین (حجم)": stable_total,
         "S&P 500": spx_m, "طلا": gold_m, "نفت": oil_m, "BTC": btc_m, "VIX": vix_m,
@@ -502,7 +544,9 @@ async def run_pipeline():
 <b>۱. وضعیت لوله‌کشی نقدینگی و بانک‌های مرکزی:</b>
 🔹 نقدینگی خالص فدرال‌رزرو (۳۰ روزه): <code>{fed_liq.fmt()}</code>
 🔹 شیب منحنی بازده ۱۰ساله-۲ساله: <code>{curve_display}</code>
-🔹 اسپرد ریسک اعتباری اوراق (OAS): <code>{oas_m.fmt()}</code>
+🔹 اسپرد ریسک اعتباری اوراق پرریسک (HY OAS): <code>{oas_m.fmt()}</code>
+🔹 اسپرد ریسک اعتباری اوراق سرمایه‌گذاری (IG OAS): <code>{ig_oas_m.fmt()}</code>
+🔹 اسپرد استرس ریپو (SOFR-EFFR): <code>{sofr_effr_m.fmt('+.0f', ' bps')}</code>
 🔹 نرخ رشد ترازنامه بانک مرکزی اروپا (ECB): <code>{ecb_m.fmt()}</code>
 🔹 نرخ رشد ترازنامه بانک مرکزی ژاپن (BoJ): <code>{boj_m.fmt()}</code>
 🔹 رشد ذخایر ارزی چین (پراکسی نقدینگی PBoC): <code>{china_fx_m.fmt()}</code>
