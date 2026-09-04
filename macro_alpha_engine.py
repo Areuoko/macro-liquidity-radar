@@ -64,6 +64,29 @@ Engine: Async Multi-Source Macro & Central Bank Liquidity Radar
      می‌شود — بدون منطق تازگی/محاسبه‌ی جدید.
  16) طبق تصمیم، هم سطح فعلی و هم درصد تغییر ۵روزه نمایش داده می‌شوند؛
      این‌ها هم فعلاً فقط نمایشی‌اند (نه ورودی stress_score) — همان اصل فاز ۲.
+
+فاز ۴ — جریان پول هوشمند (CFTC COT؛ ETF flows موکول به بعد):
+ 17) طبق تصمیم صریح، فقط CFTC COT پیاده‌سازی شد. ETF flows چون منبع
+     رایگان و دقیقی ندارد (طبق یادداشتِ خودِ روندمپ)، عمداً کنار گذاشته
+     شد تا در یک تصمیم/چت جداگانه دوباره بررسی شود.
+ 18) منبع: API رسمی و رایگان Socrata دولت آمریکا در publicreporting.cftc.gov
+     (دیتاست TFF Futures Only، شناسه gpe5-46if) — نیازی به کلید API ندارد.
+ 19) دسته‌ی «Leveraged Funds» (هج‌فاندها/سفته‌بازهای حرفه‌ای) به‌عنوان
+     پراکسیِ «پول هوشمند» انتخاب شد (نه Asset Manager/Dealer) چون این دسته
+     رایج‌ترین معیار «پوزیشن‌گیری سفته‌بازی» در تفسیر macro است.
+ 20) دو بازار پوشش داده شد: S&P 500 Consolidated (کد ۱۳۸۷۴+، سهام) و
+     USD Index (کد ۰۹۸۶۶۲، دلار) — هر دو دارایی‌ای که این موتور از قبل
+     بازدهی قیمتی‌شان را نمایش می‌دهد، پس این‌جا cross-check «پوزیشن در
+     برابر قیمت» فراهم می‌شود.
+ 21) چون COT هفته‌ای فقط یک نقطه منتشر می‌شود (نه روزانه)، از تابع جدید
+     compute_period_change_raw استفاده شد (تغییرِ خامِ کانترکت بین آخرین
+     دو هفته)، نه compute_pct_change_5 یا compute_fred_period_change —
+     چون خالص پوزیشن می‌تواند از مثبت به منفی رد شود و آن‌جا درصد بی‌معنی
+     می‌شود؛ تغییرِ خام همان قراردادِ استاندارد گزارش‌های COT بازار است.
+ 22) آستانه‌ی تازگیِ جداگانه (COT_STALE_AFTER_DAYS=10) — همان اصل فاز ۱:
+     یک آستانه‌ی سراسری برای فرکانس‌های مختلف باعث data gap کاذب می‌شود.
+ 23) این دو متریک هم فعلاً فقط نمایشی‌اند (نه ورودی stress_score) —
+     بازطراحی نهایی با rotation score برای فاز ۵ نگه داشته شده.
 """
 
 import asyncio
@@ -106,8 +129,15 @@ CHINA_FX_STALE_AFTER_DAYS = 120 # TRESEGCNM052N (ذخایر ارزی چین) ا�
                                  # در عمل روی Actions آخرین نقطه ۹۳ روز عقب‌تر دیده شد، پس آستانه‌ی
                                  # جدا و شل‌تری لازم داشت — طبق همان اصل «یک آستانه‌ی سراسری باعث
                                  # data gap می‌شود» که برای WALCL/ECBASSETSW هم رعایت شده بود
+COT_STALE_AFTER_DAYS = 10       # CFTC COT هفته‌ای یک‌بار جمعه‌ها منتشر می‌شود (داده‌ی سه‌شنبه‌ی قبل)؛
+                                 # اجرای دوشنبه‌صبح یعنی حداکثر ~۳ روز عقب‌تر در حالت عادی، اما با
+                                 # تعطیلات/تأخیر انتشار به همان الگوی WEEKLY_STALE_AFTER_DAYS=10 نیاز دارد
 FRED_MAX_RETRIES = 2
 FRED_RETRY_BACKOFF_S = 1.5
+
+CFTC_TFF_API_URL = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"  # TFF Futures Only (رسمی، Socrata)
+CFTC_SP500_CODE = "13874+"      # CME S&P 500 Consolidated (استاندارد + E-mini + Micro، تجمیع‌شده)
+CFTC_USD_INDEX_CODE = "098662"  # ICE U.S. Dollar Index (USDX)
 
 
 # --------------------------------------------------------------------------- #
@@ -255,15 +285,34 @@ def compute_fed_net_liquidity(walcl: pd.Series, tga: pd.Series, rrp: pd.Series):
     return pct, last_date.strftime("%Y-%m-%d")
 
 
-def compute_last_point(series: pd.Series):
+def compute_last_point(series: pd.Series, stale_after_days: int = STALE_AFTER_DAYS):
     """آخرین مقدار یک سری تک‌متغیره (برای شیب منحنی و OAS) + بررسی تازگی."""
     if series.empty:
         return None
     last_date = series.index[-1]
-    if _is_stale(last_date):
+    if _is_stale(last_date, stale_after_days):
         print(f"[WARN] Series stale (last point {last_date.date()})")
         return None
     return float(series.iloc[-1]), last_date.strftime("%Y-%m-%d")
+
+
+def compute_period_change_raw(series: pd.Series, lookback: int = 1, stale_after_days: int = STALE_AFTER_DAYS):
+    """
+    تغییرِ خام (نه ٪) بین آخرین نقطه و `lookback` نقطه‌ی قبل. برخلاف
+    compute_fred_period_change که درصد برمی‌گرداند و prev==0 را رد می‌کند،
+    این تابع برای سری‌هایی مثل خالص پوزیشن COT است که می‌توانند از مثبت
+    به منفی رد شوند — آنجا درصدِ تغییر بی‌معنی/گمراه‌کننده است، اما تغییرِ
+    خامِ کانترکت (مثلاً «+۵۲۰۰ کانترکت») همان قراردادِ استاندارد بازار است.
+    """
+    if len(series) <= lookback:
+        return None
+    last_date = series.index[-1]
+    if _is_stale(last_date, stale_after_days):
+        print(f"[WARN] Series stale (last point {last_date.date()})")
+        return None
+    curr = float(series.iloc[-1])
+    prev = float(series.iloc[-1 - lookback])
+    return curr - prev, last_date.strftime("%Y-%m-%d")
 
 
 def compute_spread_last_point_bps(series_a: pd.Series, series_b: pd.Series):
@@ -370,6 +419,60 @@ async def fetch_defillama_stablecoins(client: httpx.AsyncClient):
 
 
 # --------------------------------------------------------------------------- #
+# فاز ۴ — CFTC COT (Traders in Financial Futures): موقعیت‌گیری صندوق‌های
+# اهرمی (Leveraged Funds ≈ هج‌فاندها/سفته‌بازهای حرفه‌ای) به‌عنوان پراکسیِ
+# «پول هوشمند». منبع رسمی و رایگان (Socrata API دولتی)، هفته‌ای یک‌بار
+# جمعه‌ها منتشر می‌شود؛ ETF flows (بخش دوم فاز ۴) چون منبع رایگان و دقیقی
+# ندارد، فعلاً عمداً اضافه نشده — طبق تصمیم صریح، به بعد موکول شده.
+# --------------------------------------------------------------------------- #
+async def fetch_cftc_tff_net_leveraged(client: httpx.AsyncClient, contract_code: str) -> pd.Series:
+    """
+    خالص پوزیشنِ Leveraged Funds (long - short) برای یک قرارداد مشخص، از
+    گزارش هفتگی TFF-Futures-Only (دیتاست رسمی gpe5-46if). چند هفته‌ی اخیر
+    گرفته می‌شود (نه فقط آخرین) تا محاسبه‌ی تغییر هفته‌به‌هفته هم ممکن باشد.
+    """
+    params = {
+        "$where": f"cftc_contract_market_code='{contract_code}'",
+        "$select": "report_date_as_yyyy_mm_dd,lev_money_positions_long,lev_money_positions_short",
+        "$order": "report_date_as_yyyy_mm_dd DESC",
+        "$limit": "10",
+    }
+    last_err = "unknown"
+    for attempt in range(1, FRED_MAX_RETRIES + 1):
+        try:
+            resp = await client.get(CFTC_TFF_API_URL, params=params, timeout=15.0)
+            if resp.status_code == 200:
+                rows = resp.json()
+                if not rows:
+                    last_err = "empty result set"
+                else:
+                    df = pd.DataFrame(rows)
+                    df["report_date_as_yyyy_mm_dd"] = pd.to_datetime(
+                        df["report_date_as_yyyy_mm_dd"], errors="coerce"
+                    )
+                    df["lev_money_positions_long"] = pd.to_numeric(
+                        df["lev_money_positions_long"], errors="coerce"
+                    )
+                    df["lev_money_positions_short"] = pd.to_numeric(
+                        df["lev_money_positions_short"], errors="coerce"
+                    )
+                    df = df.dropna().sort_values("report_date_as_yyyy_mm_dd").reset_index(drop=True)
+                    if not df.empty:
+                        net = df["lev_money_positions_long"] - df["lev_money_positions_short"]
+                        net.index = df["report_date_as_yyyy_mm_dd"]
+                        return net
+                    last_err = "parsed JSON but no valid numeric rows"
+            else:
+                last_err = f"HTTP {resp.status_code}: {resp.text[:150]!r}"
+        except Exception as e:
+            last_err = f"{type(e).__name__}" + (f": {e}" if str(e) else "")
+        if attempt < FRED_MAX_RETRIES:
+            await asyncio.sleep(FRED_RETRY_BACKOFF_S * attempt)
+    print(f"[WARN] CFTC TFF fetch failed for contract {contract_code} after {FRED_MAX_RETRIES} tries: {last_err}")
+    return pd.Series(dtype=float)
+
+
+# --------------------------------------------------------------------------- #
 # یاهو فایننس — هر نماد جداگانه (نه batch) تا تقویم‌های معاملاتی قاطی نشوند
 # --------------------------------------------------------------------------- #
 def _fetch_yahoo_ticker_sync(ticker: str) -> pd.Series:
@@ -465,15 +568,17 @@ async def run_pipeline():
         boj_task = fetch_fred_series(client, "JPNASSETS")
         china_fx_task = fetch_fred_series(client, "TRESEGCNM052N")
         stablecoins_task = fetch_defillama_stablecoins(client)
+        cot_spx_task = fetch_cftc_tff_net_leveraged(client, CFTC_SP500_CODE)
+        cot_dxy_task = fetch_cftc_tff_net_leveraged(client, CFTC_USD_INDEX_CODE)
 
         (
             walcl, tga, rrp, t10y2y, oas, ig_oas, sofr, effr, ecb_assets, boj_assets, china_fx,
-            stablecoin_result,
+            stablecoin_result, cot_spx_net, cot_dxy_net,
         ) = await asyncio.gather(
             walcl_task, tga_task, rrp_task, t10y2y_task, oas_task, ig_oas_task,
             sofr_task, effr_task, ecb_task,
             boj_task, china_fx_task,
-            stablecoins_task,
+            stablecoins_task, cot_spx_task, cot_dxy_task,
         )
 
     yahoo_tickers = {
@@ -556,6 +661,24 @@ async def run_pipeline():
     sl_level_m = to_metric(cache, "small_large_ratio_level", compute_last_point(small_large_ratio))
     sl_chg_m = to_metric(cache, "small_large_ratio_5d_pct", compute_pct_change_5(small_large_ratio))
 
+    # فاز ۴ — CFTC COT: خالص پوزیشن Leveraged Funds + تغییر هفته‌به‌هفته
+    cot_spx_level_m = to_metric(
+        cache, "cot_spx_lev_net_contracts",
+        compute_last_point(cot_spx_net, stale_after_days=COT_STALE_AFTER_DAYS),
+    )
+    cot_spx_chg_m = to_metric(
+        cache, "cot_spx_lev_net_wow_change",
+        compute_period_change_raw(cot_spx_net, lookback=1, stale_after_days=COT_STALE_AFTER_DAYS),
+    )
+    cot_dxy_level_m = to_metric(
+        cache, "cot_dxy_lev_net_contracts",
+        compute_last_point(cot_dxy_net, stale_after_days=COT_STALE_AFTER_DAYS),
+    )
+    cot_dxy_chg_m = to_metric(
+        cache, "cot_dxy_lev_net_wow_change",
+        compute_period_change_raw(cot_dxy_net, lookback=1, stale_after_days=COT_STALE_AFTER_DAYS),
+    )
+
     save_cache(cache)
 
     # ---- استرس سیستمی: فقط اگر هر ۴ ورودی حیاتی موجودند ----------------------
@@ -580,6 +703,8 @@ async def run_pipeline():
         "Growth/Value (سطح)": gv_level_m, "Growth/Value (Δ۵روزه)": gv_chg_m,
         "Cyclical/Defensive (سطح)": cd_level_m, "Cyclical/Defensive (Δ۵روزه)": cd_chg_m,
         "Small/Large (سطح)": sl_level_m, "Small/Large (Δ۵روزه)": sl_chg_m,
+        "COT S&P500 (سطح)": cot_spx_level_m, "COT S&P500 (Δهفتگی)": cot_spx_chg_m,
+        "COT USD Index (سطح)": cot_dxy_level_m, "COT USD Index (Δهفتگی)": cot_dxy_chg_m,
     }
     issues = [f"{name} ({m.status})" for name, m in all_metrics.items() if m.status != "live"]
     quality_note = ""
@@ -619,7 +744,11 @@ async def run_pipeline():
 🔄 چرخه‌ای/تدافعی (Cyclical/Defensive، XLY÷XLP): <code>{cd_level_m.fmt('.3f', '')}</code> | تغییر ۵روزه: <code>{cd_chg_m.fmt()}</code>
 🔄 کوچک/بزرگ (Small/Large Cap، IWM÷SPY): <code>{sl_level_m.fmt('.3f', '')}</code> | تغییر ۵روزه: <code>{sl_chg_m.fmt()}</code>
 
-<b>۴. ارزیابی ریسک و موقعیت پول هوشمند (Smart Money):</b>
+<b>۴. موقعیت‌گیری صندوق‌های اهرمی (CFTC COT، Leveraged Funds):</b>
+🎯 خالص پوزیشن در S&P 500 (Consolidated): <code>{cot_spx_level_m.fmt('+,.0f', ' قرارداد')}</code> | تغییر هفتگی: <code>{cot_spx_chg_m.fmt('+,.0f', ' قرارداد')}</code>
+🎯 خالص پوزیشن در USD Index: <code>{cot_dxy_level_m.fmt('+,.0f', ' قرارداد')}</code> | تغییر هفتگی: <code>{cot_dxy_chg_m.fmt('+,.0f', ' قرارداد')}</code>
+
+<b>۵. ارزیابی ریسک و موقعیت پول هوشمند (Smart Money):</b>
 • وضعیت فاز بازار: <b>{market_phase}</b>
 • شاخص استرس سیستمی: <code>{stress_str}</code>
 • شاخص نوسانات بازار بدهی/سهام (VIX): <code>{vix_m.fmt('.1f', '')}</code>
