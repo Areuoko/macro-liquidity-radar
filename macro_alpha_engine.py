@@ -87,6 +87,23 @@ Engine: Async Multi-Source Macro & Central Bank Liquidity Radar
      یک آستانه‌ی سراسری برای فرکانس‌های مختلف باعث data gap کاذب می‌شود.
  23) این دو متریک هم فعلاً فقط نمایشی‌اند (نه ورودی stress_score) —
      بازطراحی نهایی با rotation score برای فاز ۵ نگه داشته شده.
+
+فاز ۵ — بازطراحیِ نهاییِ امتیازدهی (دو امتیازِ جدا: stress + rotation):
+ 24) طبق تصمیم صریح، stress_score همه‌ی متریک‌های جدید (IG OAS، SOFR-EFFR،
+     COT) را وزن می‌کند. ۴ ورودیِ اصلیِ قدیمی هم‌چنان «حیاتی»‌اند (غیبتِ
+     هرکدام = کل امتیاز N/A، دقیقاً مثل قبل)؛ ۳ ورودیِ جدید «اختیاری»‌اند —
+     غیبتشان فقط سهمِ خودشان را صفر می‌کند، نه کلِ امتیاز، تا تاب‌آوریِ
+     امتیازِ اصلی به هفت منبع به‌جای چهار منبع وابسته نشود.
+ 25) وزن‌های ۴ ورودیِ اصلی متناسب کم شدند (حداکثر همچنان ۱۰۰) تا جا برای
+     IG OAS/SOFR-EFFR/COT باز شود؛ جزئیاتِ کاملِ وزن‌ها در docstring خودِ
+     calculate_systemic_stress است.
+ 26) COT فقط از طریق تغییرِ هفتگیِ Leveraged Funds در S&P 500 وارد شد (نه
+     USD Index) — بودجه‌ی وزنِ COT کم است و دی‌ریسکینگِ سهام سیگنالِ
+     مستقیم‌تری برای «استرس» است؛ پوزیشنِ دلار بیشتر ماهیتِ rotation دارد.
+ 27) rotation_score طبق رودمپ کاملاً جدا از stress_score است — تابعِ جدیدِ
+     calculate_rotation_score، میانگینِ سه مومنتومِ ۵روزه‌ی فاز ۳ (از قبل
+     هم‌مقیاس، پس نیازی به آستانه/وزنِ دستی مثلِ stress_score نیست).
+ 28) هر دو امتیاز اکنون در بخشِ «۵. ارزیابی ریسک» گزارش نمایش داده می‌شوند.
 """
 
 import asyncio
@@ -505,32 +522,82 @@ async def fetch_all_yahoo_series(tickers: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# شاخص استرس سیستمی — فقط وقتی همه‌ی ورودی‌های حیاتی موجودند محاسبه می‌شود
+# فاز ۵ — دو امتیاز جدا: استرس سیستمی (۴ ورودی حیاتی + ۳ ورودی اختیاری) و
+# rotation (جدا، از سه نسبت فاز ۳). جزئیات هرکدام در docstring خودشان.
 # --------------------------------------------------------------------------- #
 def calculate_systemic_stress(
-    yield_curve_pct: float, oas_spread: float, vix: float, fed_liq_30d_pct: float
+    yield_curve_pct: float,
+    oas_spread: float,
+    vix: float,
+    fed_liq_30d_pct: float,
+    ig_oas_pct: Optional[float] = None,
+    sofr_effr_bps: Optional[float] = None,
+    cot_spx_wow_change: Optional[float] = None,
 ) -> tuple[float, str]:
+    """
+    فاز ۵ — بازطراحی: طبق تصمیم صریح، سه ورودیِ جدیدِ فاز ۲/۴ هم وزن می‌شوند:
+    IG OAS، اسپرد SOFR-EFFR، و تغییرِ هفتگیِ خالص پوزیشنِ Leveraged Funds در
+    S&P 500 (از CFTC COT). USD Index COT عمداً وارد نشد — بودجه‌ی وزنِ COT کم
+    است (۵ امتیاز) و دی‌ریسکینگِ سهام سیگنالِ مستقیم‌تری برای «استرس» است؛
+    پوزیشنِ دلار بیشتر ماهیتِ rotation دارد (در rotation_score دیده می‌شود).
+
+    ۴ ورودیِ اصلیِ قبلی هم‌چنان "حیاتی"‌اند — در سطحِ فراخوان، اگر هرکدام
+    غایب باشد کلِ امتیاز N/A می‌شود (دقیقاً مثل قبل). اما ۳ ورودیِ جدید
+    "اختیاری"‌اند (پیش‌فرض None): اگر غایب باشند فقط سهمِ خودشان صفر می‌شود،
+    نه کلِ امتیاز — چون این‌ها تصفیه‌کننده‌ی سیگنالِ اصلی‌اند نه پایه‌ی آن؛
+    وابسته‌کردنِ کلِ امتیاز به هر ۷ منبع، تاب‌آوری را بی‌دلیل کم می‌کرد.
+    غیبتِ هرکدام هم‌چنان جداگانه در پاورقیِ کیفیتِ داده گزارش می‌شود.
+
+    وزن‌های جدید (حداکثرِ جمع = ۱۰۰، دقیقاً مثل قبل):
+      شیب منحنی: ۲۰ (بود ۲۵) | HY OAS: ۲۵ (بود ۳۵) | IG OAS: ۱۰ (جدید)
+      SOFR-EFFR: ۱۰ (جدید) | VIX: ۲۰ (بود ۲۵) | نقدینگی فد: ۱۰ (بود ۱۵)
+      COT (دی‌ریسکینگِ هفتگیِ S&P): ۵ (جدید)
+
+    آستانه‌های IG OAS/SOFR-EFFR/COT اولیه و تجربی‌اند (اولین‌بار در این پروژه
+    استفاده می‌شوند) — طبق همان اصلِ «آستانه‌ی اولیه، بعد اصلاح روی داده‌ی
+    واقعی» که برای MONTHLY_STALE_AFTER_DAYS در فاز ۱ هم به کار رفت. به‌ویژه
+    آستانه‌ی خامِ COT (کانترکت) چون با رشدِ اندازه‌ی بازار در سال‌ها جابه‌جا
+    می‌شود، محتمل‌ترین کاندیدِ بازبینیِ آینده است.
+    """
     stress_score = 0.0
 
     if yield_curve_pct < 0:
-        stress_score += 25.0
+        stress_score += 20.0
     elif yield_curve_pct < 0.2:
-        stress_score += 10.0
+        stress_score += 8.0
 
     if oas_spread > 4.5:
-        stress_score += 35.0
+        stress_score += 25.0
     elif oas_spread > 3.5:
-        stress_score += 20.0
+        stress_score += 14.0
+
+    if ig_oas_pct is not None:
+        if ig_oas_pct > 2.0:
+            stress_score += 10.0
+        elif ig_oas_pct > 1.5:
+            stress_score += 5.0
+
+    if sofr_effr_bps is not None:
+        if sofr_effr_bps > 15.0:
+            stress_score += 10.0
+        elif sofr_effr_bps > 7.0:
+            stress_score += 5.0
 
     if vix > 28.0:
-        stress_score += 25.0
+        stress_score += 20.0
     elif vix > 20.0:
-        stress_score += 15.0
+        stress_score += 12.0
 
     if fed_liq_30d_pct < -2.0:
-        stress_score += 15.0
+        stress_score += 10.0
     elif fed_liq_30d_pct < -0.5:
-        stress_score += 5.0
+        stress_score += 4.0
+
+    if cot_spx_wow_change is not None:
+        if cot_spx_wow_change < -60000.0:
+            stress_score += 5.0
+        elif cot_spx_wow_change < -30000.0:
+            stress_score += 2.5
 
     stress_score = min(100.0, max(0.0, stress_score))
 
@@ -546,6 +613,32 @@ def calculate_systemic_stress(
         phase = "SYSTEMIC RISK-OFF (ریسک‌گریزی شدید)"
 
     return round(stress_score, 1), phase
+
+
+def calculate_rotation_score(
+    growth_value_chg_pct: float, cyclical_defensive_chg_pct: float, small_large_chg_pct: float
+) -> tuple[float, str]:
+    """
+    فاز ۵ — امتیازِ جدیدِ rotation، جدا از stress_score (طبق رودمپ). ورودی‌ها
+    مومنتومِ ۵روزه‌ی همان سه نسبتِ فاز ۳ هستند (Growth/Value، Cyclical/
+    Defensive، Small/Large) — همه از قبل هم‌مقیاس‌اند (٪ تغییر ۵روزه)، پس
+    برخلاف stress_score (که متریک‌های ناهم‌مقیاس را با آستانه/امتیاز جمع
+    می‌کند)، اینجا میانگینِ ساده کافی است؛ نیازی به وزن‌دهیِ دستی نیست.
+    مثبت = چرخشِ ریسک‌پذیر (رشد/چرخه‌ای/کوچک در حال پیشی‌گرفتن)،
+    منفی = چرخشِ ریسک‌گریز (ارزش/تدافعی/بزرگ در حال پیشی‌گرفتن — پناه به کیفیت).
+    آستانه‌ی ±۱.۵٪ (برای برچسبِ «چرخشِ واضح») تجربی و اولیه است، هم‌راستا با
+    دامنه‌ی واقعیِ دیده‌شده در اجراهای اولیه‌ی این پروژه (معمولاً زیرِ ~۲.۵٪).
+    """
+    avg = (growth_value_chg_pct + cyclical_defensive_chg_pct + small_large_chg_pct) / 3.0
+
+    if avg > 1.5:
+        label = "RISK-ON ROTATION (چرخش به‌سمت رشد/چرخه‌ای/کوچک)"
+    elif avg < -1.5:
+        label = "RISK-OFF ROTATION (چرخش به‌سمت ارزش/تدافعی/بزرگ)"
+    else:
+        label = "NEUTRAL / NO CLEAR ROTATION (بدون چرخش واضح)"
+
+    return round(avg, 2), label
 
 
 # --------------------------------------------------------------------------- #
@@ -681,16 +774,30 @@ async def run_pipeline():
 
     save_cache(cache)
 
-    # ---- استرس سیستمی: فقط اگر هر ۴ ورودی حیاتی موجودند ----------------------
+    # ---- استرس سیستمی: ۴ ورودی اصلی هم‌چنان حیاتی؛ ۳ ورودی جدید اختیاری ----
     critical = [curve, oas_m, vix_m, fed_liq]
     if all(m.ok for m in critical):
         stress_index, market_phase = calculate_systemic_stress(
-            curve.value, oas_m.value, vix_m.value, fed_liq.value
+            curve.value, oas_m.value, vix_m.value, fed_liq.value,
+            ig_oas_pct=ig_oas_m.value,
+            sofr_effr_bps=sofr_effr_m.value,
+            cot_spx_wow_change=cot_spx_chg_m.value,
         )
         stress_str = f"{stress_index}/100"
     else:
         stress_str = "N/A ⚠️"
         market_phase = "قابل محاسبه نیست (داده‌ی حیاتی ناقص)"
+
+    # ---- امتیاز rotation: جدا از استرس سیستمی، طبق رودمپ فاز ۵ ----------------
+    rotation_critical = [gv_chg_m, cd_chg_m, sl_chg_m]
+    if all(m.ok for m in rotation_critical):
+        rotation_index, rotation_phase = calculate_rotation_score(
+            gv_chg_m.value, cd_chg_m.value, sl_chg_m.value
+        )
+        rotation_str = f"{rotation_index:+.2f}%"
+    else:
+        rotation_str = "N/A ⚠️"
+        rotation_phase = "قابل محاسبه نیست (داده‌ی حیاتی ناقص)"
 
     # ---- پاورقیِ کیفیتِ داده -------------------------------------------------
     all_metrics = {
@@ -751,6 +858,7 @@ async def run_pipeline():
 <b>۵. ارزیابی ریسک و موقعیت پول هوشمند (Smart Money):</b>
 • وضعیت فاز بازار: <b>{market_phase}</b>
 • شاخص استرس سیستمی: <code>{stress_str}</code>
+• امتیاز rotation: <code>{rotation_str}</code> — <b>{rotation_phase}</b>
 • شاخص نوسانات بازار بدهی/سهام (VIX): <code>{vix_m.fmt('.1f', '')}</code>
 
 ⚡ <i>تولید شده توسط Macro Alpha Engine — اجرای خودکار</i>{quality_note}"""
