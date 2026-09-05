@@ -104,11 +104,36 @@ Engine: Async Multi-Source Macro & Central Bank Liquidity Radar
      calculate_rotation_score، میانگینِ سه مومنتومِ ۵روزه‌ی فاز ۳ (از قبل
      هم‌مقیاس، پس نیازی به آستانه/وزنِ دستی مثلِ stress_score نیست).
  28) هر دو امتیاز اکنون در بخشِ «۵. ارزیابی ریسک» گزارش نمایش داده می‌شوند.
+
+فاز ۶ (اختیاری، خارج از رودمپِ اصلی) — تفسیرِ تحلیلی با Gemini:
+ 29) یک بخشِ کاملاً اختیاریِ «۶. تفسیر تحلیلی» به گزارش اضافه شد: نسخه‌ی
+     بدون‌تگِ بخش‌های ۱ تا ۵ به Gemini (Google AI Studio، رایگان) داده
+     می‌شود تا رابطه/تناقضِ بینِ متریک‌ها را به فارسی توضیح دهد (مثلاً چرا
+     نفت بالا رفته اما استرس پایین است). صریحاً به‌عنوان تفسیر معرفی
+     می‌شود، نه توصیه‌ی مالی — این محدودیت در systemInstruction تحمیل شده.
+ 30) به‌جای پین‌کردنِ یک نسخه‌ی ثابت، از GEMINI_MODEL_CANDIDATES استفاده شد:
+     اول aliasِ رسمیِ گوگل «gemini-flash-latest» (خودش با هر ریلیزِ جدید
+     خودکار عوض می‌شود — دیگر نیازی به ویرایشِ دستیِ این کد برای مدل‌های
+     بعدی نیست)، بعد یک alias سبک‌ترِ backup، و در آخر یک نسخه‌ی pin‌شده‌ی
+     شناخته‌شده (gemini-3.1-flash-lite) برای وقتی هر دو alias هم‌زمان
+     مشکل داشتند — طبقِ مستندِ رسمیِ گوگل چنین چیزی، هرچند نادر، قبلاً
+     رخ داده (یک alias برای مدتی روی نسخه‌ی منقضی‌شده گیر کرد). خطای
+     HTTP 404 روی یک مدل بلافاصله به مدلِ بعدی می‌رود (retry فایده ندارد).
+ 31) کاملاً مجزا از موتورِ اصلی: اگر GOOGLE_AI_STUDIO_API_KEY تنظیم نشده
+     باشد یا fetch شکست بخورد، فقط همین یک بخش حذف می‌شود، نه کلِ گزارش —
+     همان فلسفه‌ی live/cached/missing، با این تفاوت که چون این یک متریکِ
+     عددی نیست (متنِ تفسیری‌ست)، در پاورقیِ کیفیتِ داده لیست نمی‌شود؛ نبودِ
+     آن یک اخطارِ کیفیتِ داده نیست، صرفاً یک افزوده‌ی اختیاریِ غایب است.
+ 32) نیازمندِ یک GitHub secret جدید: GOOGLE_AI_STUDIO_API_KEY — باید هم در
+     تنظیماتِ مخزن و هم در macro_radar.yml (بخشِ env) دستی اضافه شود؛ این
+     فایل بخشی از macro_alpha_engine.py نیست، پس این تغییر خودکار اعمال
+     نشده است.
 """
 
 import asyncio
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -233,6 +258,20 @@ def _is_stale(last_date, stale_after_days: int = STALE_AFTER_DAYS) -> bool:
 # --------------------------------------------------------------------------- #
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 FRED_API_URL = "https://api.stlouisfed.org/fred/series/observations"
+
+GOOGLE_AI_STUDIO_API_KEY = os.getenv("GOOGLE_AI_STUDIO_API_KEY")
+# زنجیره‌ی مدل: اول aliasِ رسمیِ «همیشه آخرین نسخه»ی گوگل (خودش را خودکار
+# آپدیت می‌کند، هیچ‌وقت نیاز به تغییرِ دستیِ این کد نیست)، بعد یک alias
+# سبک‌ترِ backup، و در آخر یک نسخه‌ی pin‌شده‌ی شناخته‌شده برای وقتی که هر دو
+# alias هم‌زمان مشکل داشتند (طبق مستندِ رسمیِ گوگل چنین اتفاقی، هرچند
+# نادر، قبلاً افتاده — یک alias برای مدتی روی نسخه‌ی منقضی‌شده گیر کرد).
+GEMINI_MODEL_CANDIDATES = [
+    "gemini-flash-latest",       # alias رسمی گوگل؛ با هر ریلیزِ جدید خودکار عوض می‌شود
+    "gemini-flash-lite-latest",  # alias جایگزین (سبک‌تر) اگر بالایی شکست خورد
+    "gemini-3.1-flash-lite",     # آخرین خط دفاعی: نسخه‌ی پایدارِ pin‌شده (بررسی‌شده سپتامبر ۲۰۲۶)
+]
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_MAX_RETRIES = 2  # تعداد تلاش برای هر مدل، نه کلِ زنجیره
 
 
 async def fetch_fred_series(client: httpx.AsyncClient, series_id: str) -> pd.Series:
@@ -487,6 +526,82 @@ async def fetch_cftc_tff_net_leveraged(client: httpx.AsyncClient, contract_code:
             await asyncio.sleep(FRED_RETRY_BACKOFF_S * attempt)
     print(f"[WARN] CFTC TFF fetch failed for contract {contract_code} after {FRED_MAX_RETRIES} tries: {last_err}")
     return pd.Series(dtype=float)
+
+
+# --------------------------------------------------------------------------- #
+# فاز ۶ (اختیاری) — تفسیرِ تحلیلیِ ارتباطِ بین متریک‌ها با Gemini (Google AI
+# Studio، رایگان). کاملاً مجزا از موتورِ اصلی: اگر کلید تنظیم نشده باشد یا
+# fetch شکست بخورد، فقط این یک بخش از گزارش حذف می‌شود، نه کل گزارش — همان
+# فلسفه‌ی live/cached/missing که برای بقیه‌ی منابع رعایت شده، با این تفاوت
+# که چون این یک متریکِ عددی نیست (متنِ تفسیری‌ست)، در پاورقیِ کیفیتِ داده هم
+# لیست نمی‌شود؛ نبودِ آن یک اخطارِ کیفیتِ داده نیست، صرفاً یک افزوده‌ی
+# اختیاریِ غایب است.
+# --------------------------------------------------------------------------- #
+async def fetch_gemini_interpretation(client: httpx.AsyncClient, metrics_summary: str) -> Optional[str]:
+    """
+    ورودی: نسخه‌ی متنیِ (بدون تگ HTML) بخش‌های ۱ تا ۵ گزارش. خروجی: یک تفسیرِ
+    کوتاهِ فارسی که رابطه/تناقضِ بینِ متریک‌ها را توضیح می‌دهد (نه توصیه‌ی مالی).
+
+    روی GEMINI_MODEL_CANDIDATES به‌ترتیب حرکت می‌کند: اول aliasِ «آخرین
+    نسخه»، بعد alias پشتیبان، در آخر نسخه‌ی pin‌شده. اگر مدلی HTTP 404 بدهد
+    (یعنی نامعتبر/منقضی شده)، بلافاصله به مدلِ بعدی می‌رود چون تلاشِ دوباره
+    روی همان مدل فایده‌ای ندارد؛ برای خطاهای دیگر (شبکه/۵xx) طبقِ معمول
+    چند بار روی همان مدل retry می‌کند و بعد به مدلِ بعدی می‌رود.
+    """
+    if not GOOGLE_AI_STUDIO_API_KEY:
+        print("[INFO] GOOGLE_AI_STUDIO_API_KEY تنظیم نشده؛ بخش تفسیرِ Gemini رد شد.")
+        return None
+
+    system_instruction = (
+        "تو یک تحلیل‌گر ماکرو هستی که این گزارشِ هفتگیِ خودکار را می‌خوانی. "
+        "به فارسی، در حداکثر دو پاراگراف کوتاه، رابطه و تناقض‌های میانِ "
+        "متریک‌های زیر را توضیح بده — مثلاً چرا نفت رشدِ زیادی داشته اما "
+        "شاخصِ استرس پایین است، یا چرا rotation ریسک‌گریز است در حالی که "
+        "COT نشانِ ریسک‌پذیری می‌دهد. عمیق و مشخص باش، نه کلی‌گویی. در پایان، "
+        "با یک جمله‌ی کوتاهِ صریح یادآوری کن که این صرفاً تفسیر است، نه "
+        "توصیه‌ی مالی یا سیگنالِ معاملاتی."
+    )
+    payload = {
+        "contents": [{"parts": [{"text": metrics_summary}]}],
+        "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 600},
+    }
+    params = {"key": GOOGLE_AI_STUDIO_API_KEY}
+
+    last_err = "unknown"
+    for model in GEMINI_MODEL_CANDIDATES:
+        url = f"{GEMINI_API_BASE}/{model}:generateContent"
+        for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+            try:
+                resp = await client.post(url, params=params, json=payload, timeout=30.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        text = "".join(p.get("text", "") for p in parts).strip()
+                        if text:
+                            return text
+                        last_err = f"[{model}] پاسخ موفق اما بدون متن (finishReason غیرعادی؟)"
+                    else:
+                        last_err = f"[{model}] بدون candidates: {str(data)[:150]!r}"
+                elif resp.status_code == 404:
+                    # مدل نامعتبر/منقضی — retry روی همین مدل فایده ندارد، برو سراغ بعدی
+                    last_err = f"[{model}] HTTP 404 (مدل نامعتبر/منقضی‌شده)"
+                    break
+                else:
+                    last_err = f"[{model}] HTTP {resp.status_code}: {resp.text[:150]!r}"
+            except Exception as e:
+                last_err = f"[{model}] {type(e).__name__}" + (f": {e}" if str(e) else "")
+            if attempt < GEMINI_MAX_RETRIES:
+                await asyncio.sleep(1.5 * attempt)
+        # اگر اینجا رسیدیم یعنی این مدل (بعد از retryهایش یا 404 فوری) شکست خورد
+
+    print(
+        f"[WARN] Gemini interpretation fetch failed for all candidates "
+        f"{GEMINI_MODEL_CANDIDATES}: {last_err}"
+    )
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -859,9 +974,19 @@ async def run_pipeline():
 • وضعیت فاز بازار: <b>{market_phase}</b>
 • شاخص استرس سیستمی: <code>{stress_str}</code>
 • امتیاز rotation: <code>{rotation_str}</code> — <b>{rotation_phase}</b>
-• شاخص نوسانات بازار بدهی/سهام (VIX): <code>{vix_m.fmt('.1f', '')}</code>
+• شاخص نوسانات بازار بدهی/سهام (VIX): <code>{vix_m.fmt('.1f', '')}</code>"""
 
-⚡ <i>تولید شده توسط Macro Alpha Engine — اجرای خودکار</i>{quality_note}"""
+    # فاز ۶ (اختیاری) — تفسیر تحلیلی با Gemini، از روی نسخه‌ی بدون-تگِ همین
+    # گزارش (بخش‌های ۱ تا ۵) که همین بالا ساخته شد؛ منبعِ جدیدی fetch نمی‌شود
+    plain_summary_for_llm = re.sub(r"</?(?:b|i|code)>", "", report)
+    async with httpx.AsyncClient() as gemini_client:
+        interpretation = await fetch_gemini_interpretation(gemini_client, plain_summary_for_llm)
+
+    interpretation_section = ""
+    if interpretation:
+        interpretation_section = f"\n\n<b>۶. تفسیر تحلیلی (Gemini AI):</b>\n{interpretation}"
+
+    report += interpretation_section + f"\n\n⚡ <i>تولید شده توسط Macro Alpha Engine — اجرای خودکار</i>{quality_note}"
 
     print("\n--- GENERATED REPORT ---")
     print(report)
