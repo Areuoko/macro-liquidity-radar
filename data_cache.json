@@ -8,32 +8,32 @@
     "as_of": "2026-11-16"
   },
   "spx_pct": {
-    "value": -0.9962956943534255,
+    "value": -1.766240509078967,
     "as_of": "2026-11-16"
   },
   "gold_pct": {
-    "value": -5.4684651841049945,
+    "value": -6.2097460201725605,
     "as_of": "2026-11-16"
   },
   "oil_pct": {
-    "value": 0.04605747407038,
+    "value": -2.06102584568348,
     "as_of": "2026-11-16"
   },
   "btc_pct": {
-    "value": -12.070253960622141,
+    "value": -11.757345059684484,
     "as_of": "2026-11-16"
   },
   "vix_level": {
-    "value": 20.450000762939453,
+    "value": 22.90999984741211,
     "as_of": "2026-11-16"
   },
   "curve_slope_pct": {
-    "value": 0.27,
-    "as_of": "2026-11-13"
+    "value": 0.29,
+    "as_of": "2026-11-16"
   },
   "credit_oas_pct": {
-    "value": 3.2,
-    "as_of": "2026-11-12"
+    "value": 3.23,
+    "as_of": "2026-11-13"
   },
   "fed_liq_30d_pct": {
     "value": -1.2655480361447802,
@@ -44,7 +44,7 @@
     "as_of": "2026-11-06"
   },
   "dxy_pct": {
-    "value": 1.812095633652167,
+    "value": 1.897688957733155,
     "as_of": "2026-11-16"
   },
   "boj_mom_pct": {
@@ -57,50 +57,50 @@
   },
   "credit_ig_oas_pct": {
     "value": 0.89,
-    "as_of": "2026-11-12"
+    "as_of": "2026-11-13"
   },
   "sofr_effr_spread_bps": {
     "value": 2.0000000000000018,
     "as_of": "2026-11-13"
   },
   "growth_value_ratio_level": {
-    "value": 0.4287943901282391,
+    "value": 0.42835204850011577,
     "as_of": "2026-11-16"
   },
   "growth_value_ratio_5d_pct": {
-    "value": -2.09052567703937,
+    "value": -2.191528482294743,
     "as_of": "2026-11-16"
   },
   "cyclical_defensive_ratio_level": {
-    "value": 1.2779631807996499,
+    "value": 1.2759179640688467,
     "as_of": "2026-11-16"
   },
   "cyclical_defensive_ratio_5d_pct": {
-    "value": -4.0128330944828905,
+    "value": -4.166448286725535,
     "as_of": "2026-11-16"
   },
   "small_large_ratio_level": {
-    "value": 0.3688040262598251,
+    "value": 0.3688627582116184,
     "as_of": "2026-11-16"
   },
   "small_large_ratio_5d_pct": {
-    "value": -1.7397282113275465,
+    "value": -1.7240802868609568,
     "as_of": "2026-11-16"
   },
   "cot_spx_lev_net_contracts": {
-    "value": -366870.0,
-    "as_of": "2026-11-03"
+    "value": -294691.0,
+    "as_of": "2026-11-10"
   },
   "cot_spx_lev_net_wow_change": {
-    "value": 33009.0,
-    "as_of": "2026-11-03"
+    "value": 72179.0,
+    "as_of": "2026-11-10"
   },
   "cot_dxy_lev_net_contracts": {
-    "value": 3311.0,
-    "as_of": "2026-11-03"
+    "value": 2850.0,
+    "as_of": "2026-11-10"
   },
   "cot_dxy_lev_net_wow_change": {
-    "value": 153.0,
-    "as_of": "2026-11-03"
+    "value": -461.0,
+    "as_of": "2026-11-10"
   }
 }
